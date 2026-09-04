@@ -531,6 +531,10 @@ struct TreeDropDelegate: DropDelegate {
     private static let textLikeTypes: [UTType] = [.plainText, .text, .folder]
 
     func validateDrop(info: DropInfo) -> Bool {
+        accepts(info)
+    }
+
+    private func accepts(_ info: DropInfo) -> Bool {
         // Our own payload settles it: the drag carries the real file too, so
         // "has a file URL" no longer means the drag came from outside.
         if !info.hasItemsConforming(to: [TreeDragPayload.type]) {
@@ -543,14 +547,16 @@ struct TreeDropDelegate: DropDelegate {
             }
         }
         if !windowState.draggingIDs.isEmpty {
+            // Nothing lands relative to a row that's being dragged itself.
+            if let row, zone(info) != .into, windowState.draggingIDs.contains(row.id) { return false }
             // A reorder within a folder is legal even though the file doesn't
             // go anywhere on disk, so only an into-drop has to clear the
             // same-folder no-op bar.
             let dest = resolvedDestination(info)
-            if zone(info) != .into, let row, !windowState.draggingIDs.contains(row.id) {
-                return windowState.draggingIDs.contains { canAccept(id: $0, into: dest, allowSameFolder: true) }
+            let allowSameFolder = zone(info) != .into
+            return windowState.draggingIDs.contains {
+                canAccept(id: $0, into: dest, allowSameFolder: allowSameFolder)
             }
-            return windowState.draggingIDs.contains { canAccept(id: $0, into: dest, allowSameFolder: false) }
         }
         // A drag from another window: its IDs live in that window's state, so
         // legality can't be settled here. `moveItems` refuses illegal moves
@@ -561,6 +567,15 @@ struct TreeDropDelegate: DropDelegate {
     /// Also where the hover feedback is decided: `dropEntered` only fires
     /// once, but which zone the cursor is in changes as it moves down a row.
     func dropUpdated(info: DropInfo) -> DropProposal? {
+        // Only ever show an indicator for a drop that would actually be taken
+        // — a refused drop never reaches `performDrop`, so anything drawn here
+        // would be left stranded on screen when the drag ends.
+        guard accepts(info) else {
+            windowState.clearDropIndicators(keepDrag: true)
+            return DropProposal(operation: .forbidden)
+        }
+        windowState.watchForDropEnd()
+
         // Assigned only on an actual change: this fires on every mouse move,
         // and republishing the same value would redraw the whole tree each
         // time the cursor twitched.
@@ -604,8 +619,7 @@ struct TreeDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        windowState.dropTargetFolderID = nil
-        windowState.dropInsertion = nil
+        windowState.clearDropIndicators()
         let destination = resolvedDestination(info)
         let beforeName = insertBeforeName(info)
         let vaultManager = self.vaultManager

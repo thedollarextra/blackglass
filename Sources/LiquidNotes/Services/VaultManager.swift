@@ -41,9 +41,10 @@ public final class VaultManager: ObservableObject {
     /// time Graph mode is toggled off and on, which used to mean a fresh
     /// vault walk + link parse of every note on each reopen; caching here lets
     /// a same-session reopen skip straight to laying out known nodes/edges.
-    /// Dropped on any structural change (create/delete/move/rename) and on
-    /// the sidebar's manual refresh; note *content* edits don't invalidate it,
-    /// so a graph can go stale on new/removed links until one of those happens.
+    /// Dropped on any structural change (create/delete/move/rename), on the
+    /// sidebar's manual refresh, and on a note save — a save can add or remove
+    /// links, and a graph that silently omits a link you just wrote is worse
+    /// than one that takes a moment to reopen.
     private var graphCache: [UUID: GraphData] = [:]
 
     func cachedGraph(for vault: Vault) -> GraphData? {
@@ -264,6 +265,11 @@ public final class VaultManager: ObservableObject {
     public func noteContentDidChange(at url: URL, content: String) {
         guard let vault = activeVault else { return }
         indexer.noteChanged(url: url, content: content, vault: vault.url)
+        // A save can add or remove wiki links, so the cached graph no longer
+        // matches the vault. Only the cache is dropped, never a rebuild kicked
+        // off — the graph is rebuilt lazily the next time it's opened, so this
+        // costs nothing while you type.
+        graphCache[vault.id] = nil
     }
 
     /// Where a new note/folder should land: inside `near` if it's a folder,

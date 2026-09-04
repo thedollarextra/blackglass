@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import AppKit
 
 /// Per-window navigation/selection UI state. Owned once per window (as a
 /// `@StateObject` on that window's root view) so windows never mirror each
@@ -42,6 +43,39 @@ final class WindowState: ObservableObject {
     struct DropInsertion: Equatable {
         let rowID: String
         let below: Bool
+    }
+
+    private var dropEndWatch: Task<Void, Never>?
+
+    /// SwiftUI only reliably reports a drag ending when it ends in a drop it
+    /// accepted. A refused drop, an Escape, or a release outside the window
+    /// can leave `dropExited` uncalled and `performDrop` unreached — which
+    /// stranded the insertion line on screen. The mouse button is the one
+    /// signal that's always true when a drag is over, so watch that instead.
+    func watchForDropEnd() {
+        guard dropEndWatch == nil else { return }
+        dropEndWatch = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard let self else { return }
+                guard NSEvent.pressedMouseButtons == 0 else { continue }
+                self.dropEndWatch = nil
+                self.clearDropIndicators()
+                return
+            }
+        }
+    }
+
+    /// `keepDrag` leaves `draggingIDs` alone, for when the drag is still in
+    /// flight and merely over somewhere it can't land.
+    func clearDropIndicators(keepDrag: Bool = false) {
+        if !keepDrag {
+            dropEndWatch?.cancel()
+            dropEndWatch = nil
+            if !draggingIDs.isEmpty { draggingIDs = [] }
+        }
+        if dropTargetFolderID != nil { dropTargetFolderID = nil }
+        if dropInsertion != nil { dropInsertion = nil }
     }
     @Published var showManageVaults = false
     @Published var showSettings = false
