@@ -258,6 +258,8 @@ final class GraphEngine: ObservableObject {
     @Published private(set) var isPaused = true
     /// Bumped when a freshly built graph lands, so the view knows to re-fit.
     @Published private(set) var generation = 0
+    /// Bumped when the hovered node changes, so a settled canvas still redraws.
+    @Published private(set) var hoverRevision = 0
     @Published var pan: CGSize = .zero
     @Published var zoom: CGFloat = 1
 
@@ -281,6 +283,26 @@ final class GraphEngine: ObservableObject {
     private var onScreen: Set<Int> = []
     private var task: Task<Void, Never>?
 
+    /// Canvas size in points, refreshed on every draw so the engine can frame
+    /// and hit-test without the view passing geometry around.
+    private(set) var viewSize: CGSize = .zero
+    /// Node under the pointer.
+    private(set) var hoveredIndex: Int?
+    /// Set by any pan, zoom or node drag; stops the camera auto-framing.
+    private(set) var userAdjusted = false
+    private var dragIndex: Int?
+    private var panning = false
+    private var lastDragPoint: CGPoint = .zero
+    /// Called when a click lands on a node, with its vault-relative path.
+    var onOpenNode: ((String) -> Void)?
+    /// Called after a full vault scan finishes, so the caller can cache the
+    /// result — a fresh build re-walks and re-parses every note, which is
+    /// the whole reason a same-session reopen should skip it via `start(cached:)`.
+    var onBuilt: ((GraphData) -> Void)?
+
+    /// Pointer distance, in points, that still counts as touching a node.
+    private static let hitSlop: CGFloat = 12
+
     // d3-force's schedule: ~300 ticks from a full reheat to rest.
     private static let alphaDecay = 0.0228
     private static let alphaMin = 0.0015
@@ -296,10 +318,21 @@ final class GraphEngine: ObservableObject {
 
     // MARK: Lifecycle
 
-    func start(vault: URL) {
+    /// `cached`, when given, is installed immediately with no rescan — reopening
+    /// Graph mode on a vault that hasn't changed since the last build shouldn't
+    /// re-walk and re-parse every note just to reproduce the same graph.
+    func start(vault: URL, cached: GraphData? = nil) {
         task?.cancel()
         pan = .zero
         zoom = 1
+        if let cached {
+            isBuilding = false
+            scanned = 0
+            total = 0
+            load(cached)
+            generation &+= 1
+            return
+        }
         isBuilding = true
         scanned = 0
         total = 0
@@ -312,6 +345,7 @@ final class GraphEngine: ObservableObject {
             self.load(built)
             self.isBuilding = false
             self.generation &+= 1
+            self.onBuilt?(built)
         }
     }
 
@@ -350,6 +384,10 @@ final class GraphEngine: ObservableObject {
         nodeCount = n
         edgeCount = next.edgeCount
         pinned = nil
+        dragIndex = nil
+        panning = false
+        hoveredIndex = nil
+        userAdjusted = false
         alphaTarget = 0
         alpha = n > 1 ? 1 : 0
         isPaused = n <= 1
@@ -368,6 +406,7 @@ final class GraphEngine: ObservableObject {
         applyRepulsion()
         applyLinks()
         integrate()
+        if !userAdjusted { fit(in: viewSize) }
     }
 
     /// Barnes-Hut n-body repulsion. The previous version sampled every
@@ -455,63 +494,134 @@ final class GraphEngine: ObservableObject {
         CGPoint(x: (p.x - pan.width) / zoom, y: (p.y - pan.height) / zoom)
     }
 
-    func nodeIndex(near point: CGPoint, within distance: CGFloat) -> Int? {
-        let x = Double(point.x), y = Double(point.y)
+    /// Canvas size, refreshed from the draw pass. Framing and hit testing read it.
+    func setViewSize(_ size: CGSize) {
+        viewSize = size
+    }
+
+    /// Screen position of a node, for hover cards and hit testing.
+    func viewPoint(of index: Int) -> CGPoint {
+        guard px.indices.contains(index) else { return .zero }
+        return CGPoint(x: px[index] * zoom + pan.width, y: py[index] * zoom + pan.height)
+    }
+
+    /// Nearest node to a point in view space, if it is close enough to count.
+    /// The tolerance is in points, so a node stays equally easy to hit at any
+    /// zoom level.
+    func hitTest(viewPoint point: CGPoint) -> Int? {
+        let target = viewToGraph(point)
+        let x = Double(target.x), y = Double(target.y)
         var best = -1
-        var bestD2 = Double(distance * distance)
+        var bestD2 = Double.greatestFiniteMagnitude
         for i in 0..<nodeCount {
             let dx = px[i] - x, dy = py[i] - y
             let d2 = dx * dx + dy * dy
             if d2 < bestD2 { bestD2 = d2; best = i }
         }
-        return best >= 0 ? best : nil
+        guard best >= 0 else { return nil }
+        let slop = Double(Self.hitSlop / max(zoom, 0.02)) + radius[best]
+        return bestD2 <= slop * slop ? best : nil
+    }
+
+    func setHover(_ index: Int?) {
+        guard index != hoveredIndex else { return }
+        hoveredIndex = index
+        hoverRevision &+= 1
     }
 
     func id(at index: Int) -> String? {
         data.ids.indices.contains(index) ? data.ids[index] : nil
     }
 
-    func beginDrag(_ index: Int) {
-        pinned = index
-        alphaTarget = 0.3
-        reheat(to: 0.3)
+    func title(at index: Int) -> String? {
+        data.titles.indices.contains(index) ? data.titles[index] : nil
     }
 
-    func dragNode(_ index: Int, to point: CGPoint) {
-        guard px.indices.contains(index) else { return }
-        px[index] = Double(point.x)
-        py[index] = Double(point.y)
-        vx[index] = 0
-        vy[index] = 0
-        reheat(to: 0.3)
+    // MARK: Pointer input
+
+    /// Left button down: grab a node if one is under the pointer, else pan.
+    func beginPrimaryDrag(at point: CGPoint) {
+        lastDragPoint = point
+        userAdjusted = true
+        if let index = hitTest(viewPoint: point) {
+            dragIndex = index
+            pinned = index
+            alphaTarget = 0.3
+            reheat(to: 0.3)
+        } else {
+            panning = true
+        }
     }
 
-    func endDrag() {
+    func continuePrimaryDrag(to point: CGPoint) {
+        defer { lastDragPoint = point }
+        if let index = dragIndex {
+            let target = viewToGraph(point)
+            px[index] = Double(target.x)
+            py[index] = Double(target.y)
+            vx[index] = 0
+            vy[index] = 0
+            reheat(to: 0.3)
+        } else if panning {
+            panBy(CGSize(width: point.x - lastDragPoint.x, height: point.y - lastDragPoint.y))
+        }
+    }
+
+    /// A release that never really moved is a click: open the note.
+    func endPrimaryDrag(at point: CGPoint, moved: Bool) {
+        if let index = dragIndex, !moved, let path = id(at: index) {
+            onOpenNode?(path)
+        }
+        dragIndex = nil
+        panning = false
         pinned = nil
         alphaTarget = 0
+        setHover(hitTest(viewPoint: point))
     }
 
-    /// Scale about a point in view space, so whatever is under the cursor stays put.
+    var isDraggingNode: Bool { dragIndex != nil }
+
+    func panBy(_ delta: CGSize) {
+        guard delta != .zero else { return }
+        userAdjusted = true
+        pan = CGSize(width: pan.width + delta.width, height: pan.height + delta.height)
+    }
+
+    /// Scale about a point in view space, so whatever is under the pointer stays put.
     func zoomBy(_ factor: CGFloat, around anchor: CGPoint) {
-        let next = min(max(zoom * factor, 0.05), 6)
+        guard factor.isFinite, factor > 0 else { return }
+        let next = min(max(zoom * factor, 0.02), 8)
         guard next != zoom else { return }
+        userAdjusted = true
         let before = viewToGraph(anchor)
         zoom = next
         pan = CGSize(
             width: anchor.x - before.x * next,
             height: anchor.y - before.y * next
         )
+        setHover(hitTest(viewPoint: anchor))
+    }
+
+    /// Frame the whole graph and hand the camera back to auto-framing.
+    func fitToView() {
+        fit(in: viewSize)
+        userAdjusted = false
     }
 
     // MARK: Drawing
 
     /// Renders the whole graph in a handful of drawing calls. `tick` is unused
     /// beyond forcing SwiftUI to re-run this closure each animation frame.
-    func draw(into ctx: inout GraphicsContext, size: CGSize, selected: String?, tick: Date) {
+    /// `matching`, when non-nil, is the set of node IDs a live search query
+    /// hit — everything else fades instead of drawing at full strength.
+    func draw(into screen: inout GraphicsContext, size: CGSize, selected: String?, matching: Set<String>?, tick: Date) {
         _ = tick
+        setViewSize(size)
         let n = nodeCount
         guard n > 0 else { return }
         let z = max(zoom, 0.0001)
+        // `screen` stays untransformed for the hover card; `ctx` is the world.
+        var ctx = screen
         ctx.translateBy(x: pan.width, y: pan.height)
         ctx.scaleBy(x: z, y: z)
 
@@ -522,9 +632,16 @@ final class GraphEngine: ObservableObject {
         let maxX = (size.width - pan.width) / z + margin
         let maxY = (size.height - pan.height) / z + margin
 
-        // One Path, one stroke. Building and stroking a separate Path per edge
-        // was what pinned a 20k-link vault at 100% CPU.
+        let matchIndex: Set<Int>? = matching.map { ids in Set(ids.compactMap { data.indexByID[$0] }) }
+        func isFaded(_ i: Int) -> Bool {
+            guard let matchIndex else { return false }
+            return !matchIndex.contains(i)
+        }
+
+        // One Path, one stroke per opacity tier. Building and stroking a
+        // separate Path per edge was what pinned a 20k-link vault at 100% CPU.
         var links = Path()
+        var fadedLinks = Path()
         var drawn = 0
         let ea = data.edgeA, eb = data.edgeB
         for e in 0..<ea.count {
@@ -532,12 +649,20 @@ final class GraphEngine: ObservableObject {
             let ax = px[a], ay = py[a], bx = px[b], by = py[b]
             if max(ax, bx) < minX || min(ax, bx) > maxX { continue }
             if max(ay, by) < minY || min(ay, by) > maxY { continue }
-            links.move(to: CGPoint(x: ax, y: ay))
-            links.addLine(to: CGPoint(x: bx, y: by))
+            if matchIndex != nil, isFaded(a), isFaded(b) {
+                fadedLinks.move(to: CGPoint(x: ax, y: ay))
+                fadedLinks.addLine(to: CGPoint(x: bx, y: by))
+            } else {
+                links.move(to: CGPoint(x: ax, y: ay))
+                links.addLine(to: CGPoint(x: bx, y: by))
+            }
             drawn += 1
             if drawn >= Self.maxEdgesDrawn { break }
         }
-        if drawn > 0 {
+        if !fadedLinks.isEmpty {
+            ctx.stroke(fadedLinks, with: .color(.secondary.opacity(0.06)), lineWidth: max(0.35, 0.9 / z))
+        }
+        if !links.isEmpty {
             ctx.stroke(
                 links,
                 with: .color(.secondary.opacity(0.28)),
@@ -547,8 +672,10 @@ final class GraphEngine: ObservableObject {
 
         visible.removeAll(keepingCapacity: true)
         var dots = Path()
+        var fadedDots = Path()
         var highlight = Path()
         let selectedIndex = selected.flatMap { data.indexByID[$0] } ?? -1
+        let hovered = hoveredIndex ?? -1
         for i in 0..<n {
             let x = px[i], y = py[i]
             if x < minX || x > maxX || y < minY || y > maxY { continue }
@@ -557,9 +684,14 @@ final class GraphEngine: ObservableObject {
             let rect = CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2)
             if i == selectedIndex {
                 highlight.addEllipse(in: rect)
+            } else if isFaded(i) {
+                fadedDots.addEllipse(in: rect)
             } else {
                 dots.addEllipse(in: rect)
             }
+        }
+        if !fadedDots.isEmpty {
+            ctx.fill(fadedDots, with: .color(.primary.opacity(0.12)))
         }
         if !dots.isEmpty {
             ctx.fill(dots, with: .color(.primary.opacity(0.85)))
@@ -568,22 +700,104 @@ final class GraphEngine: ObservableObject {
             ctx.fill(highlight, with: .color(.accentColor))
         }
 
+        // Hovered node and its immediate links, so the pointer shows structure
+        // even when zoomed too far out for labels.
+        if hovered >= 0, hovered < n {
+            var neighbours = Path()
+            for e in 0..<ea.count {
+                let a = Int(ea[e]), b = Int(eb[e])
+                guard a == hovered || b == hovered else { continue }
+                neighbours.move(to: CGPoint(x: px[a], y: py[a]))
+                neighbours.addLine(to: CGPoint(x: px[b], y: py[b]))
+            }
+            if !neighbours.isEmpty {
+                ctx.stroke(
+                    neighbours,
+                    with: .color(.accentColor.opacity(0.75)),
+                    lineWidth: max(0.8, 1.6 / z)
+                )
+            }
+            let r = radius[hovered] + 3.5 / z
+            ctx.stroke(
+                Path(ellipseIn: CGRect(
+                    x: px[hovered] - r, y: py[hovered] - r, width: r * 2, height: r * 2
+                )),
+                with: .color(.accentColor),
+                lineWidth: max(0.8, 1.8 / z)
+            )
+        }
+
         // Text is by far the most expensive thing a Canvas can draw, so labels
         // are capped and shown highest-degree first once zoomed in far enough.
-        guard z >= Self.labelZoomThreshold, !visible.isEmpty else { return }
-        onScreen.removeAll(keepingCapacity: true)
-        for i in visible { onScreen.insert(i) }
-        var budget = Self.maxLabelsDrawn
-        for i in labelOrder {
-            guard budget > 0 else { break }
-            guard onScreen.contains(i) else { continue }
-            budget -= 1
-            ctx.draw(
-                Text(data.titles[i])
-                    .font(.system(size: 10, weight: i == selectedIndex ? .semibold : .regular))
-                    .foregroundColor(.primary.opacity(0.92)),
-                at: CGPoint(x: px[i], y: py[i] + radius[i] + 7)
-            )
+        if z >= Self.labelZoomThreshold, !visible.isEmpty {
+            onScreen.removeAll(keepingCapacity: true)
+            for i in visible { onScreen.insert(i) }
+            var budget = Self.maxLabelsDrawn
+            for i in labelOrder {
+                guard budget > 0 else { break }
+                guard onScreen.contains(i), i != hovered else { continue }
+                budget -= 1
+                ctx.draw(
+                    Text(data.titles[i])
+                        .font(.system(size: 10, weight: i == selectedIndex ? .semibold : .regular))
+                        .foregroundColor(.primary.opacity(isFaded(i) ? 0.18 : 0.92)),
+                    at: CGPoint(x: px[i], y: py[i] + radius[i] + 7)
+                )
+            }
+        }
+
+        drawHoverCard(into: &screen, size: size)
+    }
+
+    /// Identity card for the hovered node, drawn in screen space so it stays
+    /// legible at any zoom.
+    private func drawHoverCard(into ctx: inout GraphicsContext, size: CGSize) {
+        guard let i = hoveredIndex, i < nodeCount, !isDraggingNode else { return }
+        let folder = GraphScanner.parentPath(of: data.ids[i])
+        let links = Int(data.degree[i])
+        var rows: [GraphicsContext.ResolvedText] = [
+            ctx.resolve(Text(data.titles[i])
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.primary))
+        ]
+        if !folder.isEmpty {
+            rows.append(ctx.resolve(Text(folder)
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)))
+        }
+        rows.append(ctx.resolve(Text(links == 1 ? "1 link" : "\(links) links")
+            .font(.system(size: 10))
+            .foregroundColor(.secondary)))
+
+        let limit = CGSize(width: 280, height: 40)
+        let sizes = rows.map { $0.measure(in: limit) }
+        let padding: CGFloat = 8
+        let spacing: CGFloat = 2
+        let cardWidth = (sizes.map(\.width).max() ?? 0) + padding * 2
+        let cardHeight = sizes.reduce(0) { $0 + $1.height }
+            + spacing * CGFloat(max(0, rows.count - 1)) + padding * 2
+
+        // Sit below-right of the node, flipping in whenever the edge is close.
+        let anchor = viewPoint(of: i)
+        let gap = radius[i] * zoom + 10
+        var origin = CGPoint(x: anchor.x + gap, y: anchor.y + gap)
+        if origin.x + cardWidth > size.width - 6 { origin.x = anchor.x - gap - cardWidth }
+        if origin.y + cardHeight > size.height - 6 { origin.y = anchor.y - gap - cardHeight }
+        origin.x = min(max(origin.x, 6), max(6, size.width - cardWidth - 6))
+        origin.y = min(max(origin.y, 6), max(6, size.height - cardHeight - 6))
+
+        let card = Path(
+            roundedRect: CGRect(origin: origin, size: CGSize(width: cardWidth, height: cardHeight)),
+            cornerRadius: 7,
+            style: .continuous
+        )
+        ctx.fill(card, with: .color(.black.opacity(0.55)))
+        ctx.stroke(card, with: .color(.white.opacity(0.16)), lineWidth: 1)
+
+        var y = origin.y + padding
+        for (row, rowSize) in zip(rows, sizes) {
+            ctx.draw(row, at: CGPoint(x: origin.x + padding, y: y), anchor: .topLeading)
+            y += rowSize.height + spacing
         }
     }
 

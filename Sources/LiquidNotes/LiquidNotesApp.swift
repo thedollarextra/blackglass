@@ -25,9 +25,12 @@ struct LiquidNotesApp: App {
         // at launch regardless of window count, and `openWindow` is already
         // valid here (the "New Window" command below already reads it the
         // same way).
-        menuBar.openWindowAction = { openWindow(id: Self.mainWindowID) }
+        // `let _ =` so this Void statement doesn't need to itself conform
+        // to `Scene` — `@SceneBuilder` treats a local declaration as plain
+        // code, not a block component, unlike a bare assignment statement.
+        let _ = (menuBar.openWindowAction = { openWindow(id: Self.mainWindowID) })
 
-        return WindowGroup("BlackGlass", id: Self.mainWindowID) {
+        WindowGroup("BlackGlass", id: Self.mainWindowID) {
             MainWindowView(vaultManager: vaultManager, server: server)
         }
         .windowStyle(.hiddenTitleBar)

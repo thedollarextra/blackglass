@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import CoreImage
+import QuartzCore
 
 public struct VisualEffectBlur: NSViewRepresentable {
     public var material: NSVisualEffectView.Material
@@ -142,159 +144,102 @@ private struct TrafficLightDot: View {
     }
 }
 
-/// Frost behind the traffic lights. On macOS 26 this is the system Liquid
-/// Glass scroll-edge blur (content goes out of focus as it passes under the
-/// lights). Older macOS keeps a masked in-window material fade.
+/// Finder's blur behind the traffic lights: rows going under the lights go
+/// out of focus, while the window itself stays exactly as solid as it is
+/// everywhere else.
+///
+/// This is a pure backdrop blur — a layer with a Gaussian `backgroundFilters`
+/// and no background color of its own, so it *only* defocuses what is already
+/// painted behind it and contributes no color. An `NSVisualEffectView` can't
+/// do this: every material composites its own tint, which is what visibly
+/// recoloured the top of the sidebar. macOS 26's `.scrollEdgeEffectStyle` is
+/// the system version of this, but it keys off a real titlebar safe area,
+/// which this window deliberately ignores to draw its own chrome.
 struct ProgressiveTitlebarGlass: View {
     var body: some View {
-        if #available(macOS 26.0, *) {
-            Rectangle()
-                .fill(.clear)
-                .glassEffect(.regular, in: .rect)
-                .mask {
-                    LinearGradient(
-                        stops: [
-                            .init(color: .black, location: 0),
-                            .init(color: .black.opacity(0.55), location: 0.45),
-                            .init(color: .black.opacity(0.18), location: 0.78),
-                            .init(color: .clear, location: 1)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                }
-                .allowsHitTesting(false)
-        } else {
-            GeometryReader { geo in
-                let h = geo.size.height
-                ZStack(alignment: .top) {
-                    FinderTitlebarFrost(material: .hudWindow, peak: 1)
-                        .frame(height: h)
-                    FinderTitlebarFrost(material: .titlebar, peak: 0.9)
-                        .frame(height: h * 0.62)
-                    FinderTitlebarFrost(material: .headerView, peak: 1)
-                        .frame(height: h * 0.28)
-                }
-            }
+        BackdropBlur(radius: 9)
             .allowsHitTesting(false)
-        }
     }
 }
 
-/// Finder-style out-of-focus blur as notes scroll under the traffic lights.
+private struct BackdropBlur: NSViewRepresentable {
+    var radius: Double
+
+    func makeNSView(context: Context) -> BackdropBlurView {
+        BackdropBlurView(radius: radius)
+    }
+
+    func updateNSView(_ nsView: BackdropBlurView, context: Context) {
+        nsView.radius = radius
+    }
+}
+
+final class BackdropBlurView: NSView {
+    var radius: Double {
+        didSet {
+            guard radius != oldValue else { return }
+            applyFilter()
+        }
+    }
+
+    /// Fades the blur out toward the bottom of the strip, so rows don't snap
+    /// from focused to defocused at a hard line.
+    private let fade = CAGradientLayer()
+
+    init(radius: Double) {
+        self.radius = radius
+        super.init(frame: .zero)
+        wantsLayer = true
+        // Without this, AppKit never runs `backgroundFilters` through Core
+        // Image at all — the filter is silently ignored rather than erroring,
+        // which is why the strip showed no blur whatsoever.
+        layerUsesCoreImageFilters = true
+        layer?.masksToBounds = true
+        autoresizingMask = [.width, .height]
+
+        fade.colors = [
+            NSColor.black.cgColor,
+            NSColor.black.withAlphaComponent(0.55).cgColor,
+            NSColor.black.withAlphaComponent(0).cgColor,
+        ]
+        fade.locations = [0, 0.55, 1]
+        // Layer geometry is bottom-up, so start at the top edge.
+        fade.startPoint = CGPoint(x: 0.5, y: 1)
+        fade.endPoint = CGPoint(x: 0.5, y: 0)
+        layer?.mask = fade
+        applyFilter()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Never intercepts clicks — rows underneath stay selectable.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func layout() {
+        super.layout()
+        // The mask is not in the layer's own layout pass, so size it by hand.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        fade.frame = layer?.bounds ?? bounds
+        CATransaction.commit()
+    }
+
+    private func applyFilter() {
+        guard let filter = CIFilter(name: "CIGaussianBlur") else { return }
+        filter.setValue(radius, forKey: kCIInputRadiusKey)
+        layer?.backgroundFilters = [filter]
+    }
+}
+
+/// Finder-style out-of-focus blur as notes scroll under the traffic lights:
+/// just pushes scroll content down so it starts below the lights instead of
+/// under them — the actual blurring is `ProgressiveTitlebarGlass`, an
+/// overlay sampling this content in real time as it scrolls past.
 struct TrafficLightScrollEdge: ViewModifier {
     func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            content
-                .scrollEdgeEffectStyle(.soft, for: .top)
-                .scrollEdgeEffectHidden(true, for: .bottom)
-                .safeAreaBar(edge: .top, spacing: 0) {
-                    Color.clear
-                        .frame(height: WindowChrome.trafficLightContentInset)
-                        .allowsHitTesting(false)
-                }
-        } else {
-            content
-                .contentMargins(.top, WindowChrome.trafficLightContentInset, for: .scrollContent)
-                .contentMargins(.top, WindowChrome.trafficLightContentInset, for: .scrollIndicators)
-        }
-    }
-}
-
-/// NSVisualEffectView with `.withinWindow` blending — the same path Finder
-/// uses to blur scrolling content under the titlebar — plus a stretchable
-/// `maskImage` so the frost eases off with no hard edge.
-private struct FinderTitlebarFrost: NSViewRepresentable {
-    var material: NSVisualEffectView.Material
-    var peak: CGFloat
-
-    func makeNSView(context: Context) -> MaskedTitlebarEffectView {
-        let view = MaskedTitlebarEffectView()
-        view.apply(material: material, peak: peak)
-        return view
-    }
-
-    func updateNSView(_ nsView: MaskedTitlebarEffectView, context: Context) {
-        nsView.apply(material: material, peak: peak)
-    }
-}
-
-final class MaskedTitlebarEffectView: NSVisualEffectView {
-    private var peak: CGFloat = 1
-    private var maskHeight: CGFloat = 0
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        blendingMode = .withinWindow
-        state = .active
-        isEmphasized = true
-        material = .titlebar
-        autoresizingMask = [.width, .height]
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        blendingMode = .withinWindow
-        state = .active
-        isEmphasized = true
-        material = .titlebar
-        autoresizingMask = [.width, .height]
-    }
-
-    func apply(material: NSVisualEffectView.Material, peak: CGFloat) {
-        self.material = material
-        blendingMode = .withinWindow
-        state = .active
-        isEmphasized = true
-        if self.peak != peak {
-            self.peak = peak
-            maskHeight = 0
-            refreshMask()
-        }
-    }
-
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
-        refreshMask()
-    }
-
-    private func refreshMask() {
-        let height = bounds.height
-        guard height > 0, abs(height - maskHeight) > 0.5 else { return }
-        maskHeight = height
-        maskImage = Self.fadeMask(height: height, peak: peak)
-    }
-
-    /// Alpha-only vertical gradient. Stops match the previous fade so the
-    /// frost still starts in the same place; only the material is Finder’s.
-    private static func fadeMask(height: CGFloat, peak: CGFloat) -> NSImage {
-        let size = NSSize(width: 1, height: max(ceil(height), 1))
-        let image = NSImage(size: size, flipped: true) { rect in
-            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            let stops: [(CGFloat, CGFloat)] = [
-                (0.00, peak),
-                (0.45, peak * 0.55),
-                (0.78, peak * 0.18),
-                (1.00, 0)
-            ]
-            let colors = stops.map { CGColor(gray: 0, alpha: $0.1) } as CFArray
-            let locations = stops.map(\.0)
-            guard let gradient = CGGradient(
-                colorsSpace: CGColorSpaceCreateDeviceGray(),
-                colors: colors,
-                locations: locations
-            ) else { return false }
-            ctx.drawLinearGradient(
-                gradient,
-                start: CGPoint(x: 0, y: 0),
-                end: CGPoint(x: 0, y: rect.height),
-                options: []
-            )
-            return true
-        }
-        image.resizingMode = .stretch
-        image.capInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
-        return image
+        content
+            .contentMargins(.top, WindowChrome.trafficLightContentInset, for: .scrollContent)
+            .contentMargins(.top, WindowChrome.trafficLightContentInset, for: .scrollIndicators)
     }
 }
 
@@ -305,59 +250,6 @@ public extension View {
 
     func hidesTitlebarFill() -> some View {
         modifier(TitlebarFillHider())
-    }
-
-    /// Replicates the system's "double-click title bar" gesture on custom
-    /// chrome standing in for the real (hidden) titlebar, honoring the
-    /// user's own System Settings choice instead of hard-coding one.
-    func systemTitlebarDoubleClick() -> some View {
-        modifier(TitlebarDoubleClickModifier())
-    }
-
-    /// Tags this view's window `.liquidNotesMainWindow` so
-    /// `MenuBarController` can find/reuse the real main window without
-    /// matching a popped-out note window, which also hosts `MainWindowView`
-    /// but passes `isMain: false` here.
-    func tagAsLiquidNotesMainWindow(_ isMain: Bool = true) -> some View {
-        background {
-            if isMain {
-                MainWindowTagger()
-            }
-        }
-    }
-}
-
-extension NSUserInterfaceItemIdentifier {
-    static let liquidNotesMainWindow = NSUserInterfaceItemIdentifier("liquidNotesMainWindow")
-}
-
-private struct TitlebarDoubleClickModifier: ViewModifier {
-    func body(content: Content) -> some View {
-        content
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                guard let window = NSApp.keyWindow else { return }
-                switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
-                case "Minimize":
-                    window.performMiniaturize(nil)
-                case "None":
-                    break
-                default:
-                    window.performZoom(nil)
-                }
-            }
-    }
-}
-
-private struct MainWindowTagger: NSViewRepresentable {
-    func makeNSView(context: Context) -> TaggingView { TaggingView() }
-    func updateNSView(_ nsView: TaggingView, context: Context) {}
-}
-
-private final class TaggingView: NSView {
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        window?.identifier = .liquidNotesMainWindow
     }
 }
 
@@ -427,21 +319,72 @@ final class WindowChromeView: NSView {
     func applyChrome() {
         guard let window else { return }
         configureLiquidNotesWindow(window)
-        // A window launched this app silently at login (see AppDelegate):
-        // close the very first one instead of letting it appear, leaving
-        // only the menu bar extra behind. One-shot — every window after
-        // this turn (including one the user opens later from the status
-        // item) behaves normally.
-        if let delegate = NSApp.delegate as? AppDelegate, delegate.suppressInitialWindow {
-            delegate.suppressInitialWindow = false
-            // Deferred one tick: closing a window from inside its own
-            // layout pass (this can be called from `layout()`) is safer
-            // done just after that pass finishes, and it's still well
-            // before AppKit would actually composite the window on screen.
-            DispatchQueue.main.async { [weak window] in
-                window?.close()
-            }
+    }
+}
+
+public extension View {
+    /// Double-clicking empty title-bar-style chrome (the row that stands in
+    /// for a real NSWindow titlebar) does the same thing double-clicking an
+    /// actual title bar does — zoom or minimize, per the user's System
+    /// Settings preference. Only observes `mouseUp`, so `mouseDown` still
+    /// falls through untouched to `isMovableByWindowBackground`'s own drag
+    /// tracking on the same region.
+    func systemTitlebarDoubleClick() -> some View {
+        background(TitlebarDoubleClickCatcher())
+    }
+}
+
+private struct TitlebarDoubleClickCatcher: NSViewRepresentable {
+    func makeNSView(context: Context) -> TitlebarDoubleClickView { TitlebarDoubleClickView() }
+    func updateNSView(_ nsView: TitlebarDoubleClickView, context: Context) {}
+}
+
+final class TitlebarDoubleClickView: NSView {
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        guard event.clickCount == 2, let window else { return }
+        switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
+        case "Minimize": window.miniaturize(nil)
+        case "None": break
+        default: window.zoom(nil)
         }
+    }
+}
+
+extension NSUserInterfaceItemIdentifier {
+    /// Marks a window as belonging to the "main" WindowGroup (sidebar +
+    /// editor), as opposed to a popped-out single-note window. Lets
+    /// `MenuBarController` find a main window to surface even while note
+    /// windows are also open, since both kinds share the same hidden-titlebar
+    /// chrome and `canBecomeMain`.
+    static let liquidNotesMainWindow = NSUserInterfaceItemIdentifier("LiquidNotes.mainWindow")
+}
+
+public extension View {
+    /// Tags the window this view lands in as a main LiquidNotes window.
+    /// Apply once, to the root of the main WindowGroup's content. Pass
+    /// `false` for a popped-out single-note window, which shares this same
+    /// view but shouldn't be found by `MenuBarController`'s main-window
+    /// lookup.
+    @ViewBuilder
+    func tagAsLiquidNotesMainWindow(_ isMain: Bool = true) -> some View {
+        if isMain {
+            background(MainWindowTagger())
+        } else {
+            self
+        }
+    }
+}
+
+private struct MainWindowTagger: NSViewRepresentable {
+    func makeNSView(context: Context) -> TaggingView { TaggingView() }
+    func updateNSView(_ nsView: TaggingView, context: Context) {}
+}
+
+private final class TaggingView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        window?.identifier = .liquidNotesMainWindow
     }
 }
 

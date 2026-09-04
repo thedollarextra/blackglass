@@ -37,8 +37,17 @@ struct GeneralSettingsView: View {
             }
 
             Section {
+                Toggle("Keep search always open", isOn: $store.settings.nativeSearchAlwaysVisible)
+                Text("Keeps the sidebar's search field open instead of behind the search icon. Escape clears it instead of closing it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Toggle("Hide sidebar by default in popped-out note windows", isOn: $store.settings.hidePopOutSidebarByDefault)
+            }
+
+            Section {
                 Toggle("Show in menu bar", isOn: $store.settings.menuBarMode)
-                Text("Shows a LiquidNotes extra in the menu bar. Closing the last window keeps the app running there instead of quitting.")
+                Text("Shows a BlackGlass extra in the menu bar. Closing the last window keeps the app running there instead of quitting.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -56,7 +65,7 @@ struct GeneralSettingsView: View {
                         }
                     }
                 ))
-                Text("Starts LiquidNotes automatically when you log in to this Mac.")
+                Text("Starts BlackGlass automatically when you log in to this Mac.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let loginError {
@@ -92,8 +101,8 @@ struct ServerSettingsView: View {
                         }
                     }
                 ))
-                Toggle("Start server when LiquidNotes opens", isOn: $store.settings.serverAutoStart)
-                Text("While the server is on, LiquidNotes stays in the menu bar so phones can keep connecting. Closing the window hides the Dock icon until you open LiquidNotes again.")
+                Toggle("Start server when BlackGlass opens", isOn: $store.settings.serverAutoStart)
+                Text("While the server is on, BlackGlass stays in the menu bar so phones can keep connecting. Closing the window hides the Dock icon until you open BlackGlass again.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -121,6 +130,10 @@ struct ServerSettingsView: View {
                 Text(store.settings.serverLocalhostOnly
                      ? "Only apps on this Mac can open the web app."
                      : "Phones and other computers on your Wi-Fi can open the web app.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Always show search in web app", isOn: $store.settings.webSearchAlwaysVisible)
+                Text("Keeps the search field open in the sidebar instead of behind the search icon.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -348,7 +361,7 @@ struct IndexSettingsView: View {
                         footprint = LiquidNotesMemory.footprint()
                     }
                 }
-                Text("Notes are re-indexed as you edit them. A full rebuild is only needed if files changed outside LiquidNotes.")
+                Text("Notes are re-indexed as you edit them. A full rebuild is only needed if files changed outside BlackGlass.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

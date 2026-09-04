@@ -21,6 +21,7 @@ struct InlineRenameField: NSViewRepresentable {
         field.cell?.isScrollable = true
         field.stringValue = text
         field.delegate = context.coordinator
+        context.coordinator.field = field
         return field
     }
 
@@ -33,10 +34,12 @@ struct InlineRenameField: NSViewRepresentable {
         }
     }
 
+    @MainActor
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var text: Binding<String>
         var onCommit: (Bool) -> Void
         var onCancel: () -> Void
+        weak var field: RenameTextField?
         private var didFinish = false
 
         init(text: Binding<String>, onCommit: @escaping (Bool) -> Void, onCancel: @escaping () -> Void) {
@@ -55,6 +58,18 @@ struct InlineRenameField: NSViewRepresentable {
             finish(focusEditor: movement == NSReturnTextMovement)
         }
 
+        /// Vetoes exactly one same-tick attempt to pull focus away from the
+        /// field right as it claims first responder (see
+        /// `RenameTextField.claimFocus`) — something else, most likely the
+        /// editor pane appearing for the freshly created note, otherwise
+        /// sometimes wins that race and the rename never gets typed into. A
+        /// real click elsewhere or Enter always lands on a later run-loop
+        /// tick, once `justClaimedFocus` has cleared, so those still end
+        /// editing normally.
+        func textShouldEndEditing(_ textObject: NSText) -> Bool {
+            !(field?.justClaimedFocus ?? false)
+        }
+
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
                 finish(focusEditor: true)
@@ -70,20 +85,6 @@ struct InlineRenameField: NSViewRepresentable {
             return false
         }
 
-        /// Vetoes exactly one resignation attempt that lands in the same
-        /// run-loop turn the field claims first responder in (see
-        /// `RenameTextField.suppressNextResignation`). Something else in the
-        /// window — most often the editor pane appearing for the just-created
-        /// note in the same update — can also request first responder that
-        /// same turn, which used to end the rename before the user had even
-        /// seen it start. A real click elsewhere or Tab always arrives on a
-        /// later turn, so this never blocks genuine user-driven commits.
-        func control(_ control: NSControl, textShouldEndEditing fieldEditor: NSText) -> Bool {
-            guard let field = control as? RenameTextField, field.suppressNextResignation else { return true }
-            field.suppressNextResignation = false
-            return false
-        }
-
         private func finish(focusEditor: Bool) {
             guard !didFinish else { return }
             didFinish = true
@@ -93,27 +94,28 @@ struct InlineRenameField: NSViewRepresentable {
 }
 
 final class RenameTextField: NSTextField {
-    private var didAttemptFocus = false
-    fileprivate var suppressNextResignation = false
+    private var didStealFocus = false
+    /// True only for the run-loop tick in which this field claims first
+    /// responder. `Coordinator.textShouldEndEditing` uses this to veto a
+    /// same-tick attempt to steal focus back; cleared on the next tick so a
+    /// later, genuine resign (real click elsewhere, Enter) isn't affected.
+    fileprivate var justClaimedFocus = false
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        guard window != nil, !didAttemptFocus else { return }
-        didAttemptFocus = true
+        guard window != nil, !didStealFocus else { return }
+        didStealFocus = true
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.suppressNextResignation = true
-            guard self.window?.makeFirstResponder(self) == true else {
-                self.suppressNextResignation = false
-                return
-            }
-            self.currentEditor()?.selectAll(nil)
-            // Only the very next resignation attempt is guarded — anything
-            // after this turn is a genuine click-away or Tab and must end
-            // the rename as usual.
-            DispatchQueue.main.async { [weak self] in
-                self?.suppressNextResignation = false
-            }
+            self?.claimFocus()
+        }
+    }
+
+    private func claimFocus() {
+        justClaimedFocus = true
+        window?.makeFirstResponder(self)
+        currentEditor()?.selectAll(nil)
+        DispatchQueue.main.async { [weak self] in
+            self?.justClaimedFocus = false
         }
     }
 }

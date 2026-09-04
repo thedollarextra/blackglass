@@ -136,7 +136,8 @@ public struct OmnibarView: View {
     }
 
     private func selectResult(_ result: SearchResult) {
-        windowState.revealInTree(result.fileItem, in: vaultManager)
+        let live = vaultManager.findInTree(id: result.fileItem.id) ?? result.fileItem
+        windowState.reveal(live, ancestorFolderIDs: vaultManager.ancestorFolderIDs(of: live.url))
         isPresented = false
     }
 }

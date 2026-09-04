@@ -7,6 +7,10 @@ struct CookedNoteView: NSViewRepresentable {
     var fileItem: FileItem
     var vaultManager: VaultManager
     var themeClass: String
+    /// Wiki-link clicks report the target here rather than touching selection
+    /// directly, since what "navigate" means differs between the main
+    /// window (reveal in the sidebar) and a popped-out note window (open
+    /// another pop-out).
     var onNavigate: (FileItem) -> Void
 
     func makeCoordinator() -> Coordinator { Coordinator(vaultManager: vaultManager, onNavigate: onNavigate) }
@@ -25,6 +29,22 @@ struct CookedNoteView: NSViewRepresentable {
         context.coordinator.vaultManager = vaultManager
         context.coordinator.onNavigate = onNavigate
         guard let vault = vaultManager.activeVault else { return }
+        let coordinator = context.coordinator
+        // `updateNSView` reruns on every redraw of whatever contains this
+        // view, not just when our own inputs change — e.g. another window
+        // creating a note touches `vaultManager.fileTree`, which this editor
+        // observes (via `vaultManager`) but doesn't render from. Re-parsing
+        // the note's markdown and rebuilding its HTML on every one of those
+        // was pure waste; skip it unless something we actually render from
+        // has changed since the last call.
+        guard markdown != coordinator.lastMarkdown
+                || fileItem.url != coordinator.lastFileURL
+                || themeClass != coordinator.lastThemeClass
+                || vault.url != coordinator.lastVaultURL else { return }
+        coordinator.lastMarkdown = markdown
+        coordinator.lastFileURL = fileItem.url
+        coordinator.lastThemeClass = themeClass
+        coordinator.lastVaultURL = vault.url
         let html = OFMHTML.render(
             markdown: markdown,
             current: fileItem.url,
@@ -33,8 +53,8 @@ struct CookedNoteView: NSViewRepresentable {
             search: vaultManager.searchIndex,
             mode: OFMRenderMode(web: false, themeClass: themeClass)
         )
-        if html != context.coordinator.lastHTML {
-            context.coordinator.lastHTML = html
+        if html != coordinator.lastHTML {
+            coordinator.lastHTML = html
             view.loadHTMLString(html, baseURL: vault.url)
         }
     }
@@ -44,6 +64,11 @@ struct CookedNoteView: NSViewRepresentable {
         var vaultManager: VaultManager
         var onNavigate: (FileItem) -> Void
         var lastHTML: String = ""
+        // Inputs that produced `lastHTML` — see the skip check in `updateNSView`.
+        var lastMarkdown: String?
+        var lastFileURL: URL?
+        var lastThemeClass: String?
+        var lastVaultURL: URL?
 
         init(vaultManager: VaultManager, onNavigate: @escaping (FileItem) -> Void) {
             self.vaultManager = vaultManager

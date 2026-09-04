@@ -4,13 +4,8 @@ struct GraphView: View {
     @ObservedObject var vaultManager: VaultManager
     @ObservedObject var windowState: WindowState
     @StateObject private var engine = GraphEngine()
-    @State private var dragIndex: Int?
-    @State private var panning = false
-    @State private var panAnchor: CGSize = .zero
-    @State private var magnifyAnchor: CGFloat = 1
-    /// Stops the camera from following the layout once the user takes over.
-    @State private var userAdjusted = false
-    @State private var canvasSize: CGSize = CGSize(width: 800, height: 600)
+    @State private var searchMatches: Set<String>?
+    @State private var matchTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -22,13 +17,15 @@ struct GraphView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                    .systemTitlebarDoubleClick()
                 if engine.isBuilding {
                     ProgressView()
                         .controlSize(.small)
                 }
-                Button("Fit") { engine.fit(in: canvasSize) }
+                Button("Fit") { engine.fitToView() }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
+                    .help("Frame the whole graph (or double-tap the trackpad)")
                 Button("Close") { windowState.showGraph = false }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
@@ -53,16 +50,29 @@ struct GraphView: View {
                 .ignoresSafeArea()
         }
         .ignoresSafeArea(edges: .top)
-        .onAppear { start() }
+        .onAppear {
+            engine.onOpenNode = { path in
+                guard let vault = vaultManager.activeVault else { return }
+                let url = vault.url.appendingPathComponent(path)
+                let item = FileItem(url: url, isDirectory: false)
+                let live = vaultManager.findInTree(id: item.id) ?? item
+                windowState.reveal(live, ancestorFolderIDs: vaultManager.ancestorFolderIDs(of: live.url))
+                windowState.showGraph = false
+            }
+            // Stash every freshly-built graph so the *next* time Graph mode
+            // opens on this vault (this window or another), `start()` below
+            // can skip straight to it instead of re-walking the vault.
+            engine.onBuilt = { data in
+                guard let vault = vaultManager.activeVault else { return }
+                vaultManager.cacheGraph(data, for: vault)
+            }
+            start()
+            scheduleMatchUpdate()
+        }
         .onDisappear { engine.stop() }
         .onChange(of: vaultManager.activeVault?.id) { _, _ in start() }
-        .onChange(of: engine.generation) { _, _ in
-            // A fresh build (not a cache hit — that doesn't bump `generation`)
-            // just landed; keep it around for the next time Graph mode opens.
-            if let vault = vaultManager.activeVault {
-                vaultManager.cacheGraph(engine.data, for: vault)
-            }
-        }
+        .onChange(of: windowState.searchQuery) { _, _ in scheduleMatchUpdate() }
+        .onChange(of: windowState.isSearching) { _, _ in scheduleMatchUpdate() }
         .onExitCommand { windowState.showGraph = false }
     }
 
@@ -70,38 +80,43 @@ struct GraphView: View {
         if engine.isBuilding {
             return engine.total > 0 ? "Building \(engine.scanned)/\(engine.total)…" : "Scanning…"
         }
+        if let hovered = engine.hoveredIndex, let title = engine.title(at: hovered) {
+            return title
+        }
+        if let searchMatches {
+            return "\(searchMatches.count) of \(engine.nodeCount) notes match"
+        }
         return "\(engine.nodeCount) notes · \(engine.edgeCount) links"
     }
 
     private func canvas(tick: Date) -> some View {
-        GeometryReader { geo in
-            Canvas(opaque: false, rendersAsynchronously: false) { context, size in
-                var ctx = context
-                engine.draw(into: &ctx, size: size, selected: selectedRelPath, tick: tick)
+        Canvas(opaque: false, rendersAsynchronously: false) { context, size in
+            var ctx = context
+            engine.draw(into: &ctx, size: size, selected: selectedRelPath, matching: searchMatches, tick: tick)
+        }
+        // Input sits above the canvas: hover, wheel zoom, middle-button pan and
+        // trackpad gestures all need AppKit events.
+        .overlay { GraphInputSurface(engine: engine) }
+        .onChange(of: timelineKey(tick)) { _, _ in
+            engine.step()
+        }
+        .onChange(of: engine.generation) { _, _ in
+            engine.fitToView()
+        }
+        .overlay(alignment: .bottom) {
+            if engine.nodeCount > 0 {
+                Text("Scroll to zoom · pinch or two fingers to browse · middle-drag to pan · click a note to open it")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .padding(.bottom, 8)
+                    .allowsHitTesting(false)
             }
-            .gesture(graphGesture(in: geo.size))
-            .onAppear {
-                canvasSize = geo.size
-                engine.fit(in: geo.size)
-            }
-            .onChange(of: timelineKey(tick)) { _, _ in
-                engine.step()
-                // Keep the whole graph framed while it expands out of its
-                // seeded positions, until the user pans, zooms, or drags.
-                if !userAdjusted { engine.fit(in: geo.size) }
-            }
-            .onChange(of: geo.size) { _, size in
-                canvasSize = size
-            }
-            .onChange(of: engine.generation) { _, _ in
-                userAdjusted = false
-                engine.fit(in: geo.size)
-            }
-            .overlay {
-                if engine.nodeCount == 0 && !engine.isBuilding {
-                    Text("No markdown notes found in this vault.")
-                        .foregroundStyle(.secondary)
-                }
+        }
+        .overlay {
+            if engine.nodeCount == 0 && !engine.isBuilding {
+                Text("No markdown notes found in this vault.")
+                    .foregroundStyle(.secondary)
+                    .allowsHitTesting(false)
             }
         }
     }
@@ -117,62 +132,26 @@ struct GraphView: View {
         return GraphScanner.relative(selected.url, vault: vault.url)
     }
 
-    private func graphGesture(in size: CGSize) -> some Gesture {
-        DragGesture(minimumDistance: 0)
-            .onChanged { value in
-                if dragIndex == nil && !panning {
-                    let start = engine.viewToGraph(value.startLocation)
-                    if let index = engine.nodeIndex(near: start, within: 18 / max(engine.zoom, 0.2)) {
-                        dragIndex = index
-                        engine.beginDrag(index)
-                        userAdjusted = true
-                    } else {
-                        panning = true
-                        panAnchor = engine.pan
-                        userAdjusted = true
-                    }
-                }
-                if let index = dragIndex {
-                    engine.dragNode(index, to: engine.viewToGraph(value.location))
-                } else if panning {
-                    engine.pan = CGSize(
-                        width: panAnchor.width + value.translation.width,
-                        height: panAnchor.height + value.translation.height
-                    )
-                }
-            }
-            .onEnded { value in
-                if let index = dragIndex,
-                   hypot(value.translation.width, value.translation.height) < 4,
-                   let path = engine.id(at: index),
-                   let vault = vaultManager.activeVault {
-                    let url = vault.url.appendingPathComponent(path)
-                    windowState.revealInTree(FileItem(url: url, isDirectory: false), in: vaultManager)
-                    windowState.showGraph = false
-                }
-                engine.endDrag()
-                dragIndex = nil
-                panning = false
-            }
-            .simultaneously(with:
-                MagnificationGesture()
-                    .onChanged { value in
-                        guard value > 0 else { return }
-                        let factor = value / magnifyAnchor
-                        magnifyAnchor = value
-                        userAdjusted = true
-                        engine.zoomBy(factor, around: CGPoint(x: size.width / 2, y: size.height / 2))
-                    }
-                    .onEnded { _ in magnifyAnchor = 1 }
-            )
-    }
-
     private func start() {
         guard let vault = vaultManager.activeVault else { return }
-        if let cached = vaultManager.cachedGraph(for: vault) {
-            engine.load(cached)
-        } else {
-            engine.start(vault: vault.url)
+        engine.start(vault: vault.url, cached: vaultManager.cachedGraph(for: vault))
+    }
+
+    /// Debounced, mirroring the sidebar's own search: a big vault's index
+    /// lookup is cheap, but there's no reason to redo it on every keystroke.
+    private func scheduleMatchUpdate() {
+        matchTask?.cancel()
+        let query = windowState.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard windowState.isSearching, !query.isEmpty, let vault = vaultManager.activeVault else {
+            searchMatches = nil
+            return
+        }
+        matchTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard !Task.isCancelled else { return }
+            let hits = await vaultManager.searchAsync(query: query, limit: 5000)
+            guard !Task.isCancelled else { return }
+            searchMatches = Set(hits.map { GraphScanner.relative($0.fileItem.url, vault: vault.url) })
         }
     }
 }

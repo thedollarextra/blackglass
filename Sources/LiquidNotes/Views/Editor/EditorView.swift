@@ -31,7 +31,11 @@ public struct EditorView: View {
     @ObservedObject var vaultManager: VaultManager
     let fileItem: FileItem
     @Binding var sidebarVisible: Bool
-    var onNavigate: (FileItem) -> Void
+    /// False in a popped-out note window, which has no sidebar to toggle.
+    var showSidebarToggle: Bool = true
+    /// False inside the popped-out window itself, so it can't pop out again.
+    var showPopOutButton: Bool = true
+    var onNavigate: (FileItem) -> Void = { _ in }
     var onContentSaved: ((URL, String) -> Void)? = nil
     @ObservedObject private var settingsStore = SettingsStore.shared
     @Environment(\.openWindow) private var openWindow
@@ -39,7 +43,13 @@ public struct EditorView: View {
     @State private var mode: EditorMode = .uncooked
     @State private var saveTask: Task<Void, Never>?
     @State private var lastSaved: String = ""
-    @FocusState private var isEditorFocused: Bool
+    @State private var requestFocusAtStart = false
+
+    @State private var showFind = false
+    @State private var findQuery = ""
+    @State private var findMatchCount = 0
+    @State private var findCurrentMatch = 0
+    @FocusState private var isFindFieldFocused: Bool
 
     private var themeClass: String {
         switch settingsStore.settings.appearance {
@@ -52,20 +62,28 @@ public struct EditorView: View {
     public var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                SidebarToggle(sidebarVisible: $sidebarVisible)
+                if showSidebarToggle {
+                    SidebarToggle(sidebarVisible: $sidebarVisible)
+                }
                 Text(fileItem.displayTitle)
                     .font(.headline)
                     .lineLimit(1)
                     .help(fileItem.url.path)
 
                 Spacer(minLength: 8)
+                    .systemTitlebarDoubleClick()
 
-                Button(action: { openWindow(id: LiquidNotesApp.noteWindowID, value: fileItem.url) }) {
-                    Image(systemName: "arrow.up.right.square")
-                        .font(.body)
+                if showPopOutButton {
+                    Button {
+                        openWindow(value: fileItem.url)
+                    } label: {
+                        Image(systemName: "arrow.up.forward.app")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Open in New Window")
+                    .accessibilityLabel("Open in New Window")
                 }
-                .buttonStyle(.plain)
-                .help("Open in New Window")
 
                 EggModeToggle(mode: $mode)
             }
@@ -76,14 +94,27 @@ public struct EditorView: View {
 
             Group {
                 if mode == .uncooked {
-                    TextEditor(text: $text)
-                        .font(.system(.body, design: .monospaced))
-                        .padding(16)
-                        .scrollContentBackground(.hidden)
-                        .focused($isEditorFocused)
-                        .onChange(of: text) { _, newText in
-                            queueAutoSave(newText)
+                    FindableTextView(
+                        text: $text,
+                        searchQuery: showFind ? findQuery : "",
+                        matchCount: $findMatchCount,
+                        currentMatch: $findCurrentMatch,
+                        requestFocusAtStart: $requestFocusAtStart,
+                        onTextChange: queueAutoSave
+                    )
+                    .overlay(alignment: .topTrailing) {
+                        if showFind {
+                            FindBar(
+                                query: $findQuery,
+                                matchCount: findMatchCount,
+                                currentMatch: $findCurrentMatch,
+                                onClose: { showFind = false },
+                                isFocused: $isFindFieldFocused
+                            )
+                            .padding(.top, 10)
+                            .padding(.trailing, 14)
                         }
+                    }
                 } else {
                     CookedNoteView(
                         markdown: text,
@@ -114,9 +145,12 @@ public struct EditorView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .liquidNotesFocusEditor)) { _ in
             mode = .uncooked
-            DispatchQueue.main.async {
-                isEditorFocused = true
-            }
+            requestFocusAtStart = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .liquidNotesFindInNote)) { _ in
+            guard mode == .uncooked else { return }
+            showFind = true
+            isFindFieldFocused = true
         }
     }
 
@@ -124,6 +158,11 @@ public struct EditorView: View {
         let loaded = (try? String(contentsOf: fileItem.url, encoding: .utf8)) ?? ""
         text = loaded
         lastSaved = loaded
+        showFind = false
+        findQuery = ""
+        if mode == .uncooked {
+            requestFocusAtStart = true
+        }
     }
 
     private func queueAutoSave(_ newText: String) {
