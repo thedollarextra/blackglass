@@ -1,0 +1,6 @@
+# The committed app bundle is binary throughout. Marked explicitly so no
+# end-of-line normalisation can ever touch the executable or its code
+# signature, which would corrupt a clone into refusing to launch.
+BlackGlass.app/** binary
+*.icns binary
+*.png binary

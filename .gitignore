@@ -6,5 +6,11 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+# Every app bundle except the current build — which is committed so the app
+# can be downloaded without building it. The exception has to name the
+# directory itself: git won't descend into an ignored directory, so a rule
+# for its contents alone would never match. This also keeps out the
+# "BlackGlass 2.app" duplicates iCloud leaves behind on a sync conflict.
 *.app
+!/BlackGlass.app
 .claude/
