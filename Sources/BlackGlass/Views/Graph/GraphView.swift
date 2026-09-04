@@ -66,7 +66,9 @@ struct GraphView: View {
                 let item = FileItem(url: url, isDirectory: false)
                 let live = vaultManager.findInTree(id: item.id) ?? item
                 windowState.reveal(live, ancestorFolderIDs: vaultManager.ancestorFolderIDs(of: live.url))
-                windowState.showGraph = false
+                // The graph stays up: it's its own pane now, so the note opens
+                // beside it. Closing on every click made sense only back when
+                // the graph took over the editor's space.
             }
             // Stash every freshly-built graph so the *next* time Graph mode
             // opens on this vault (this window or another), `start()` below
