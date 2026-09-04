@@ -36,5 +36,20 @@
     <string>Copyright © 2026 BlackGlass</string>
     <key>NSLocalNetworkUsageDescription</key>
     <string>BlackGlass can serve its web app to phones and computers on your local network.</string>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key>
+            <string>com.liquidnotes.tree-items</string>
+            <key>UTTypeDescription</key>
+            <string>BlackGlass sidebar items</string>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+            </array>
+            <key>UTTypeTagSpecification</key>
+            <dict/>
+        </dict>
+    </array>
 </dict>
 </plist>

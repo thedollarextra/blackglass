@@ -37,6 +37,16 @@ struct GeneralSettingsView: View {
             }
 
             Section {
+                Picker("⌘K opens", selection: $store.settings.commandKSearch) {
+                    ForEach(CommandKSearch.allCases) { choice in
+                        Text(choice.title).tag(choice)
+                    }
+                }
+                Text("Which search ⌘K opens. Both stay one click away from the sidebar's toolbar icons, and ⌃F always opens the sidebar search.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 Toggle("Keep search always open", isOn: $store.settings.nativeSearchAlwaysVisible)
                 Text("Keeps the sidebar's search field open instead of behind the search icon. Escape clears it instead of closing it.")
                     .font(.caption)

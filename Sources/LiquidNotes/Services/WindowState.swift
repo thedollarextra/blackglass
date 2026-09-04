@@ -20,6 +20,29 @@ final class WindowState: ObservableObject {
     @Published var searchQuery = ""
     @Published var isSearching = false
     @Published var showOmnibar = false
+    /// Published rather than kept inside `OmnibarView` so the graph can dim
+    /// non-matches while an Omnisearch is being typed.
+    @Published var omnibarQuery = ""
+    /// IDs currently being dragged out of the tree, published the moment the
+    /// drag starts. `DropDelegate.validateDrop` has to answer synchronously,
+    /// but a drop payload can only be read asynchronously — so legality
+    /// (self-drop, descendant-drop, same-parent no-op) is decided against
+    /// this instead. Empty means the drag came from outside the app.
+    @Published var draggingIDs: [String] = []
+    /// Folder a drag is currently hovering, so the row that will actually
+    /// receive the drop highlights — including when the cursor is over one of
+    /// that folder's *files*, since those land in the folder alongside them.
+    @Published var dropTargetFolderID: String?
+    /// Where an insertion line is currently drawn — the row it sits against,
+    /// and which edge. Set instead of `dropTargetFolderID` when the cursor is
+    /// near a row's edge rather than its middle, so "put it between these
+    /// two" and "put it inside this folder" look different.
+    @Published var dropInsertion: DropInsertion?
+
+    struct DropInsertion: Equatable {
+        let rowID: String
+        let below: Bool
+    }
     @Published var showManageVaults = false
     @Published var showSettings = false
 

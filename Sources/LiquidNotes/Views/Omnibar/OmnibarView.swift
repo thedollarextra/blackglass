@@ -5,7 +5,6 @@ public struct OmnibarView: View {
     @ObservedObject var vaultManager: VaultManager
     @ObservedObject var windowState: WindowState
     @Binding var isPresented: Bool
-    @State private var query: String = ""
     @State private var results: [SearchResult] = []
     @State private var selectedIndex: Int = 0
     @State private var searchTask: Task<Void, Never>?
@@ -17,16 +16,16 @@ public struct OmnibarView: View {
                 Image(systemName: "magnifyingglass")
                     .font(.title3)
                     .foregroundStyle(.secondary)
-                TextField("Search all notes or jump to file…", text: $query)
+                TextField("Search all notes or jump to file…", text: $windowState.omnibarQuery)
                     .textFieldStyle(.plain)
                     .font(.title3)
                     .focused($isSearchFocused)
-                    .onChange(of: query) { _, newQuery in
+                    .onChange(of: windowState.omnibarQuery) { _, newQuery in
                         performSearch(newQuery)
                     }
                     .onSubmit { confirmSelection() }
-                if !query.isEmpty {
-                    Button(action: { searchTask?.cancel(); query = ""; results = [] }) {
+                if !windowState.omnibarQuery.isEmpty {
+                    Button(action: { searchTask?.cancel(); windowState.omnibarQuery = ""; results = [] }) {
                         Image(systemName: "xmark.circle.fill")
                             .foregroundStyle(.secondary)
                     }
@@ -39,7 +38,7 @@ public struct OmnibarView: View {
 
             if results.isEmpty {
                 VStack(spacing: 6) {
-                    Text(query.isEmpty ? "Type to search notes in active vault" : "No notes found")
+                    Text(windowState.omnibarQuery.isEmpty ? "Type to search notes in active vault" : "No notes found")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -84,7 +83,6 @@ public struct OmnibarView: View {
         }
         .frame(width: 580)
         .liquidGlass(cornerRadius: 16)
-        .padding()
         .onAppear {
             isSearchFocused = true
         }

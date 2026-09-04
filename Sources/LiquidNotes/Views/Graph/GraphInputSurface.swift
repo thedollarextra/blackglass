@@ -27,6 +27,7 @@ final class GraphInputView: NSView {
     private var trackingArea: NSTrackingArea?
     private var leftDown = false
     private var middlePanning = false
+    private var orbiting = false
     private var dragDistance: CGFloat = 0
     private var lastMiddlePoint: CGPoint = .zero
 
@@ -34,6 +35,8 @@ final class GraphInputView: NSView {
     private static let clickSlop: CGFloat = 3
     /// Zoom per notch of a non-precise wheel.
     private static let wheelZoomStep: CGFloat = 1.15
+    /// Trackpad twist is reported in degrees; the engine orbits in pixels.
+    private static let twistToPixels: CGFloat = 2.5
 
     /// Match SwiftUI's top-left origin so no coordinate flipping is needed.
     override var isFlipped: Bool { true }
@@ -77,7 +80,7 @@ final class GraphInputView: NSView {
     }
 
     private func applyCursor() {
-        if middlePanning {
+        if middlePanning || orbiting {
             NSCursor.closedHand.set()
         } else if engine?.hoveredIndex != nil {
             NSCursor.pointingHand.set()
@@ -86,12 +89,20 @@ final class GraphInputView: NSView {
         }
     }
 
-    // MARK: Left button - drag a node, or pan the canvas
+    // MARK: Left button - orbit, drag a node, or pan the canvas
 
     override func mouseDown(with event: NSEvent) {
         let point = location(event)
         leftDown = true
         dragDistance = 0
+        // Shift claims the drag for the camera, so a plain drag keeps meaning
+        // exactly what it always did: move a node, or pan.
+        if event.modifierFlags.contains(.shift), engine?.is3D == true {
+            orbiting = true
+            engine?.setHover(nil)
+            applyCursor()
+            return
+        }
         engine?.setHover(engine?.hitTest(viewPoint: point))
         engine?.beginPrimaryDrag(at: point)
     }
@@ -99,12 +110,21 @@ final class GraphInputView: NSView {
     override func mouseDragged(with event: NSEvent) {
         guard leftDown else { return }
         dragDistance += hypot(event.deltaX, event.deltaY)
+        if orbiting {
+            engine?.orbitBy(dx: Double(event.deltaX), dy: Double(event.deltaY))
+            return
+        }
         engine?.continuePrimaryDrag(to: location(event))
     }
 
     override func mouseUp(with event: NSEvent) {
         guard leftDown else { return }
         leftDown = false
+        if orbiting {
+            orbiting = false
+            applyCursor()
+            return
+        }
         engine?.endPrimaryDrag(at: location(event), moved: dragDistance > Self.clickSlop)
         applyCursor()
     }
@@ -142,6 +162,12 @@ final class GraphInputView: NSView {
         // Precise deltas mean a trackpad or Magic Mouse: two fingers pan, the
         // way dragging the canvas does. A notched wheel zooms instead.
         if event.hasPreciseScrollingDeltas && !wantsZoom {
+            // In 3D the same two fingers orbit, since panning a projection you
+            // cannot turn is close to useless; shift falls back to panning.
+            if engine.is3D && !event.modifierFlags.contains(.shift) {
+                engine.orbitBy(dx: Double(event.scrollingDeltaX), dy: Double(event.scrollingDeltaY))
+                return
+            }
             // Use the delta as macOS reports it, so the canvas follows the
             // user's own natural-scrolling preference.
             engine.panBy(CGSize(width: event.scrollingDeltaX, height: event.scrollingDeltaY))
@@ -160,9 +186,21 @@ final class GraphInputView: NSView {
     // MARK: Multitouch gestures
 
     override func magnify(with event: NSEvent) {
+        guard let engine else { return }
         // `magnification` is the increment for this event, so it composes
         // directly into the running zoom.
-        engine?.zoomBy(1 + event.magnification, around: location(event))
+        if engine.is3D {
+            // Pinching out means "get closer", which is a shorter camera
+            // distance rather than a bigger picture.
+            engine.dollyBy(1 - Double(event.magnification))
+        } else {
+            engine.zoomBy(1 + event.magnification, around: location(event))
+        }
+    }
+
+    override func rotate(with event: NSEvent) {
+        guard let engine, engine.is3D else { return }
+        engine.orbitBy(dx: Double(CGFloat(event.rotation) * Self.twistToPixels), dy: 0)
     }
 
     override func smartMagnify(with event: NSEvent) {

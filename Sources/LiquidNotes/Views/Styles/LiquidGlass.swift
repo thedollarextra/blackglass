@@ -332,6 +332,22 @@ public extension View {
     func systemTitlebarDoubleClick() -> some View {
         background(TitlebarDoubleClickCatcher())
     }
+
+    /// Opts a region out of the window's `isMovableByWindowBackground`, so a
+    /// drag starting here moves what's under the cursor rather than the whole
+    /// window — without it, dragging a file row just slides the window.
+    func blocksWindowDrag() -> some View {
+        background(WindowDragBlocker())
+    }
+}
+
+private struct WindowDragBlocker: NSViewRepresentable {
+    func makeNSView(context: Context) -> WindowDragBlockingView { WindowDragBlockingView() }
+    func updateNSView(_ nsView: WindowDragBlockingView, context: Context) {}
+}
+
+final class WindowDragBlockingView: NSView {
+    override var mouseDownCanMoveWindow: Bool { false }
 }
 
 private struct TitlebarDoubleClickCatcher: NSViewRepresentable {

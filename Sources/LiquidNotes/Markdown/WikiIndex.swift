@@ -93,6 +93,19 @@ final class WikiIndex: @unchecked Sendable {
             byTitle[old.title.lowercased()]?.removeAll { $0 == key }
             for a in old.aliases { if byAlias[a.lowercased()] == key { byAlias.removeValue(forKey: a.lowercased()) } }
         }
+        // The filename index too, or a moved note keeps resolving to where
+        // it used to be: a move is remove-then-add, so without this the name
+        // maps to both paths, and `resolveFile` prefers the shortest — the
+        // dead one, whenever a note moves deeper into the tree.
+        let name = url.lastPathComponent.lowercased()
+        if var paths = filesByName[name] {
+            paths.removeAll { $0 == key }
+            if paths.isEmpty {
+                filesByName.removeValue(forKey: name)
+            } else {
+                filesByName[name] = paths
+            }
+        }
         lock.unlock()
     }
 

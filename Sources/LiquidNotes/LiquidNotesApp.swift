@@ -61,8 +61,13 @@ struct LiquidNotesApp: App {
                 .keyboardShortcut("f", modifiers: [.control])
                 .disabled(windowState == nil)
 
-                Button("Search Notes (Omnibar)") {
-                    windowState?.showOmnibar.toggle()
+                // ⌘K goes to whichever search Settings names; the other is
+                // still one click away on the sidebar's toolbar.
+                Button(settingsStore.settings.commandKSearch.title) {
+                    switch settingsStore.settings.commandKSearch {
+                    case .omnisearch: windowState?.showOmnibar.toggle()
+                    case .sidebar: windowState?.isSearching.toggle()
+                    }
                 }
                 .keyboardShortcut("k", modifiers: [.command])
                 .disabled(windowState == nil)

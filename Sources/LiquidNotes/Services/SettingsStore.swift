@@ -56,6 +56,22 @@ enum AppAppearance: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// Which of the two searches ⌘K opens. Both stay reachable by clicking
+/// their own icon in the sidebar's toolbar regardless of this setting.
+enum CommandKSearch: String, Codable, CaseIterable, Identifiable {
+    case omnisearch
+    case sidebar
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .omnisearch: "Omnisearch"
+        case .sidebar: "Sidebar search"
+        }
+    }
+}
+
 struct AppSettings: Codable, Equatable {
     var menuBarMode: Bool = false
     var launchAtLogin: Bool = false
@@ -75,11 +91,12 @@ struct AppSettings: Codable, Equatable {
     /// A popped-out note window starts with the sidebar hidden by default
     /// (it's meant to be a focused, single-note window) unless turned off.
     var hidePopOutSidebarByDefault: Bool = true
+    var commandKSearch: CommandKSearch = .omnisearch
 
     enum CodingKeys: String, CodingKey {
         case menuBarMode, launchAtLogin, serverEnabled, serverAutoStart
         case serverPort, serverLocalhostOnly, appearance, webSearchAlwaysVisible
-        case nativeSearchAlwaysVisible, hidePopOutSidebarByDefault
+        case nativeSearchAlwaysVisible, hidePopOutSidebarByDefault, commandKSearch
     }
 
     init() {}
@@ -96,6 +113,7 @@ struct AppSettings: Codable, Equatable {
         webSearchAlwaysVisible = try c.decodeIfPresent(Bool.self, forKey: .webSearchAlwaysVisible) ?? false
         nativeSearchAlwaysVisible = try c.decodeIfPresent(Bool.self, forKey: .nativeSearchAlwaysVisible) ?? false
         hidePopOutSidebarByDefault = try c.decodeIfPresent(Bool.self, forKey: .hidePopOutSidebarByDefault) ?? true
+        commandKSearch = try c.decodeIfPresent(CommandKSearch.self, forKey: .commandKSearch) ?? .omnisearch
     }
 }
 

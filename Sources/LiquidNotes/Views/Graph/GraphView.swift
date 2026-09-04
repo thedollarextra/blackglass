@@ -22,6 +22,15 @@ struct GraphView: View {
                     ProgressView()
                         .controlSize(.small)
                 }
+                scopeControls
+                Button {
+                    engine.setThreeD(!engine.is3D)
+                } label: {
+                    Image(systemName: "cube")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(engine.is3D ? Color.accentColor : Color.secondary)
+                .help(engine.is3D ? "Back to a flat layout" : "3D layout — shift-drag or two fingers to orbit")
                 Button("Fit") { engine.fitToView() }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
@@ -66,14 +75,65 @@ struct GraphView: View {
                 guard let vault = vaultManager.activeVault else { return }
                 vaultManager.cacheGraph(data, for: vault)
             }
+            // Set before the graph lands, so the first scoping already knows
+            // which note the local view is centred on.
+            engine.setFocus(selectedRelPath)
             start()
             scheduleMatchUpdate()
         }
         .onDisappear { engine.stop() }
         .onChange(of: vaultManager.activeVault?.id) { _, _ in start() }
+        .onChange(of: selectedRelPath) { _, next in engine.setFocus(next) }
         .onChange(of: windowState.searchQuery) { _, _ in scheduleMatchUpdate() }
         .onChange(of: windowState.isSearching) { _, _ in scheduleMatchUpdate() }
+        .onChange(of: windowState.omnibarQuery) { _, _ in scheduleMatchUpdate() }
+        .onChange(of: windowState.showOmnibar) { _, _ in scheduleMatchUpdate() }
         .onExitCommand { windowState.showGraph = false }
+    }
+
+    /// Local/global scoping. The whole point of the graph is the neighbourhood
+    /// around what you are reading; the whole vault at once is a screensaver.
+    @ViewBuilder
+    private var scopeControls: some View {
+        Button {
+            engine.setScope(engine.scope == .local ? .global : .local)
+        } label: {
+            Image(systemName: engine.scope == .local ? "scope" : "globe")
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(engine.scope == .local ? Color.accentColor : Color.secondary)
+        .help(engine.scope == .local
+            ? "Showing the selected note's neighbourhood — switch to the whole vault"
+            : "Showing the whole vault — switch to the selected note's neighbourhood")
+
+        if engine.scope == .local {
+            HStack(spacing: 4) {
+                Button { engine.setLocalDepth(engine.localDepth - 1) } label: {
+                    Image(systemName: "minus")
+                }
+                .buttonStyle(.plain)
+                .disabled(engine.localDepth <= 1)
+                Text("\(engine.localDepth)")
+                    .monospacedDigit()
+                Button { engine.setLocalDepth(engine.localDepth + 1) } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.plain)
+                .disabled(engine.localDepth >= 3)
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .help("Hops out from the selected note")
+        } else {
+            Button {
+                engine.setShowOrphans(!engine.showOrphans)
+            } label: {
+                Image(systemName: "circle.dotted")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(engine.showOrphans ? Color.accentColor : Color.secondary)
+            .help(engine.showOrphans ? "Hide unlinked notes" : "Show unlinked notes")
+        }
     }
 
     private var statusText: String {
@@ -84,9 +144,15 @@ struct GraphView: View {
             return title
         }
         if let searchMatches {
-            return "\(searchMatches.count) of \(engine.nodeCount) notes match"
+            return "\(searchMatches.count) of \(engine.sourceNodeCount) notes match"
         }
-        return "\(engine.nodeCount) notes · \(engine.edgeCount) links"
+        var parts = ["\(engine.nodeCount) notes", "\(engine.edgeCount) links"]
+        // Only meaningful for the whole-vault view; in an ego graph "hidden"
+        // would just be "the rest of the vault", which is the point of it.
+        if engine.scope == .global, engine.hiddenCount > 0 {
+            parts.append("\(engine.hiddenCount) unlinked")
+        }
+        return parts.joined(separator: " · ")
     }
 
     private func canvas(tick: Date) -> some View {
@@ -100,12 +166,9 @@ struct GraphView: View {
         .onChange(of: timelineKey(tick)) { _, _ in
             engine.step()
         }
-        .onChange(of: engine.generation) { _, _ in
-            engine.fitToView()
-        }
         .overlay(alignment: .bottom) {
             if engine.nodeCount > 0 {
-                Text("Scroll to zoom · pinch or two fingers to browse · middle-drag to pan · click a note to open it")
+                Text(hintText)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .padding(.bottom, 8)
@@ -114,11 +177,29 @@ struct GraphView: View {
         }
         .overlay {
             if engine.nodeCount == 0 && !engine.isBuilding {
-                Text("No markdown notes found in this vault.")
+                Text(emptyText)
                     .foregroundStyle(.secondary)
                     .allowsHitTesting(false)
             }
         }
+    }
+
+    private var hintText: String {
+        engine.is3D
+            ? "Shift-drag or two fingers to orbit · pinch to move closer · click a note to open it"
+            : "Scroll to zoom · pinch or two fingers to browse · middle-drag to pan · click a note to open it"
+    }
+
+    private var emptyText: String {
+        if engine.sourceNodeCount == 0 {
+            return "No markdown notes found in this vault."
+        }
+        if engine.scope == .local {
+            return engine.focusID == nil
+                ? "Select a note to see its neighbourhood, or switch to the whole vault."
+                : "That note isn't in the graph yet."
+        }
+        return "No linked notes. Show unlinked notes to see the rest of the vault."
     }
 
     /// Steps the simulation from `onChange` rather than inside the draw closure,
@@ -141,8 +222,12 @@ struct GraphView: View {
     /// lookup is cheap, but there's no reason to redo it on every keystroke.
     private func scheduleMatchUpdate() {
         matchTask?.cancel()
-        let query = windowState.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard windowState.isSearching, !query.isEmpty, let vault = vaultManager.activeVault else {
+        // Either search dims the graph — whichever one is currently open.
+        let raw = windowState.showOmnibar
+            ? windowState.omnibarQuery
+            : (windowState.isSearching ? windowState.searchQuery : "")
+        let query = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty, let vault = vaultManager.activeVault else {
             searchMatches = nil
             return
         }

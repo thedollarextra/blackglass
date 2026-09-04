@@ -44,11 +44,18 @@ struct MainWindowView: View {
                         .ignoresSafeArea(edges: .top)
                 }
 
+                // Its own column between the tree and the editor, so a note
+                // stays open and readable while the graph is up.
+                if windowState.showGraph {
+                    GraphView(vaultManager: vaultManager, windowState: windowState)
+                        .frame(minWidth: 260, idealWidth: 420, maxWidth: .infinity)
+                        .frame(maxHeight: .infinity)
+                        .ignoresSafeArea(edges: .top)
+                }
+
                 Group {
-                    if windowState.showGraph {
-                        GraphView(vaultManager: vaultManager, windowState: windowState)
-                    } else if let id = windowState.soleSelectedID,
-                              let selected = vaultManager.findInTree(id: id), !selected.isDirectory {
+                    if let id = windowState.soleSelectedID,
+                       let selected = vaultManager.findInTree(id: id), !selected.isDirectory {
                         EditorView(
                             vaultManager: vaultManager,
                             fileItem: selected,
@@ -87,6 +94,10 @@ struct MainWindowView: View {
                         VisualEffectBlur(material: .hudWindow)
                             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                     }
+                    // Outer margin goes here, after the backdrop, so the
+                    // backdrop stays the exact size of the panel instead of
+                    // painting a bright ring around it.
+                    .padding()
                     .transition(.scale(scale: 0.95).combined(with: .opacity))
             }
         }

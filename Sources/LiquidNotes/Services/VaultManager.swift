@@ -9,6 +9,11 @@ public final class VaultManager: ObservableObject {
     /// Last trashed batch, restorable via `undoLastDelete()`. Shared across
     /// windows since it mirrors a real filesystem action, not window UI state.
     @Published public private(set) var lastDelete: DeletedBatch?
+    /// Result of the most recent import, so a drop that quietly skipped
+    /// everything (40 photos onto the tree, say) says so instead of just
+    /// appearing to do nothing. Cleared by the sidebar after it's shown.
+    @Published public var lastImportSummary: String?
+    private let treeOrder = TreeOrderStore()
 
     public struct TreeReveal: Equatable {
         public let itemID: String
@@ -386,7 +391,8 @@ public final class VaultManager: ObservableObject {
             guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDir) else { continue }
 
             if isDir.boolValue {
-                let movedNotes = findInTree(id: source.path).map { flattenNotes([$0]) } ?? []
+                let subtree = findInTree(id: source.path)
+                let movedNotes = subtree.map { flattenNotes([$0]) } ?? []
                 let relativePaths = movedNotes.map { String($0.url.standardizedFileURL.path.dropFirst(source.path.count)) }
                 let dest = uniqueDirectoryURL(in: destFolder, stem: source.lastPathComponent)
                 do {
@@ -398,7 +404,16 @@ public final class VaultManager: ObservableObject {
                 for (note, relative) in zip(movedNotes, relativePaths) {
                     indexer.noteMoved(from: note.url, to: dest.appendingPathComponent(relative), vault: active.url)
                 }
-                remap[source.path] = dest.standardizedFileURL.path
+                // Every descendant's path changed too, not just the folder's.
+                // Without these entries a selection inside the moved folder
+                // keeps dead IDs — rows stop highlighting and ⌫ no-ops.
+                let destPath = dest.standardizedFileURL.path
+                remap[source.path] = destPath
+                for oldPath in (subtree?.folderIDsInSubtree ?? []).union(movedNotes.map(\.id)) {
+                    guard oldPath != source.path,
+                          oldPath.hasPrefix(source.path + "/") else { continue }
+                    remap[oldPath] = destPath + oldPath.dropFirst(source.path.count)
+                }
             } else {
                 let stem = source.deletingPathExtension().lastPathComponent
                 let dest = uniqueURL(in: destFolder, stem: stem, ext: source.pathExtension)
@@ -417,34 +432,173 @@ public final class VaultManager: ObservableObject {
         return remap
     }
 
-    /// Copies external files — dragged in from Finder, not already part of
-    /// this vault — into `destinationFolder`. Only markdown-family files are
-    /// imported; anything else is silently skipped, since the sidebar only
-    /// ever represents note files to begin with.
+    /// Moves `items` into `destinationFolder` and parks them immediately
+    /// before `beforeName` (or at the end, when nil), recording the result as
+    /// that folder's manual order.
+    ///
+    /// Items already in the destination aren't moved on disk at all — a
+    /// same-folder drag is purely a reorder, and `moveItems` rightly refuses
+    /// it as a no-op — but they still take their new position.
+    @discardableResult
+    public func reorderItems(_ items: [FileItem], into destinationFolder: URL, before beforeName: String?) -> [String: String] {
+        let destFolder = destinationFolder.standardizedFileURL
+        let incoming = items.filter {
+            $0.url.deletingLastPathComponent().standardizedFileURL.path != destFolder.path
+        }
+        let remap = incoming.isEmpty ? [:] : moveItems(incoming, to: destFolder)
+
+        // A plain drop *into* a folder shouldn't silently freeze that folder
+        // into manual order for good — it only earns an order once something
+        // is deliberately positioned in it, or if it already had one.
+        guard beforeName != nil || treeOrder.currentOrder(in: destFolder) != nil else {
+            refreshFileTree()
+            return remap
+        }
+
+        // Names as they actually landed — a collision may have renamed one.
+        let movedNames = items.map { item in
+            URL(fileURLWithPath: remap[item.id] ?? item.id).lastPathComponent
+        }
+        var ordered = childNames(of: destFolder).filter { !movedNames.contains($0) }
+        let insertAt = beforeName.flatMap { name in
+            movedNames.contains(name) ? nil : ordered.firstIndex(of: name)
+        } ?? ordered.count
+        ordered.insert(contentsOf: movedNames, at: insertAt)
+
+        treeOrder.setOrder(ordered, in: destFolder)
+        refreshFileTree()
+        return remap
+    }
+
+    /// Restores a folder to plain name order.
+    public func clearManualOrder(of folder: URL) {
+        treeOrder.clearOrder(in: folder)
+        refreshFileTree()
+    }
+
+    public func hasManualOrder(_ folder: URL) -> Bool {
+        treeOrder.currentOrder(in: folder) != nil
+    }
+
+    /// Everything in `folder` the sidebar would show, in current tree order.
+    private func childNames(of folder: URL) -> [String] {
+        let contents = (try? FileManager.default.contentsOfDirectory(
+            at: folder,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return treeOrder.sorted(contents, in: folder).compactMap { url in
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return nil }
+            if isDir.boolValue { return url.lastPathComponent }
+            return Self.importableExtensions.contains(url.pathExtension.lowercased()) ? url.lastPathComponent : nil
+        }
+    }
+
+    /// File types the vault will take in. The sidebar only ever represents
+    /// note files, so anything else has nowhere to live.
+    public static let importableExtensions: Set<String> = ["md", "markdown", "txt"]
+
+    /// Copies external files — dragged in from Finder — into
+    /// `destinationFolder`. Dropped folders are imported recursively,
+    /// keeping their structure. Sources that already live in this vault are
+    /// *moved* rather than duplicated: dragging a note in from a Finder
+    /// window showing the vault should behave like dragging it in the tree,
+    /// not leave a "note 2" behind.
     public func importFiles(_ urls: [URL], into destinationFolder: URL) {
         guard let active = activeVault else { return }
         let destFolder = destinationFolder.standardizedFileURL
-        let allowedExtensions: Set<String> = ["md", "markdown", "txt"]
-        var imported = false
+        let vaultPath = active.url.standardizedFileURL.path
 
-        for source in urls {
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDir), !isDir.boolValue,
-                  allowedExtensions.contains(source.pathExtension.lowercased()) else { continue }
-            let stem = source.deletingPathExtension().lastPathComponent
-            let dest = uniqueURL(in: destFolder, stem: stem, ext: source.pathExtension)
-            do {
-                try FileManager.default.copyItem(at: source, to: dest)
-            } catch {
-                NSLog("LiquidNotes import failed: \(error.localizedDescription)")
-                continue
-            }
-            indexer.noteAdded(url: dest, vault: active.url)
-            imported = true
+        let inVault = urls.filter { $0.standardizedFileURL.path.hasPrefix(vaultPath + "/") }
+        let external = urls.filter { !$0.standardizedFileURL.path.hasPrefix(vaultPath + "/") }
+
+        if !inVault.isEmpty {
+            moveItems(inVault.compactMap { findInTree(id: $0.standardizedFileURL.path) }, to: destFolder)
         }
-        guard imported else { return }
+
+        var imported = 0
+        var skipped = 0
+
+        for source in external {
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDir) else { continue }
+            if isDir.boolValue {
+                let dest = uniqueDirectoryURL(in: destFolder, stem: source.lastPathComponent)
+                let counts = importDirectory(source, into: dest, vault: active.url)
+                imported += counts.imported
+                skipped += counts.skipped
+            } else if importFile(source, into: destFolder, vault: active.url) {
+                imported += 1
+            } else {
+                skipped += 1
+            }
+        }
+
+        lastImportSummary = Self.importSummary(imported: imported, skipped: skipped)
+        guard imported > 0 else { return }
         invalidateGraphCache()
         refreshFileTree()
+    }
+
+    /// Copies one file in, if its type is importable. Returns whether it landed.
+    private func importFile(_ source: URL, into destFolder: URL, vault: URL) -> Bool {
+        guard Self.importableExtensions.contains(source.pathExtension.lowercased()) else { return false }
+        let stem = source.deletingPathExtension().lastPathComponent
+        let dest = uniqueURL(in: destFolder, stem: stem, ext: source.pathExtension)
+        do {
+            try FileManager.default.copyItem(at: source, to: dest)
+        } catch {
+            NSLog("LiquidNotes import failed: \(error.localizedDescription)")
+            return false
+        }
+        indexer.noteAdded(url: dest, vault: vault)
+        return true
+    }
+
+    /// Walks a dropped folder, recreating it under `dest` with only the
+    /// importable files in it. Directories that end up contributing nothing
+    /// are removed again rather than left as empty shells.
+    private func importDirectory(_ source: URL, into dest: URL, vault: URL) -> (imported: Int, skipped: Int) {
+        var imported = 0
+        var skipped = 0
+        let contents = (try? FileManager.default.contentsOfDirectory(
+            at: source,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        guard (try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)) != nil else {
+            return (0, contents.count)
+        }
+
+        for child in contents {
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: child.path, isDirectory: &isDir) else { continue }
+            if isDir.boolValue {
+                let counts = importDirectory(child, into: dest.appendingPathComponent(child.lastPathComponent), vault: vault)
+                imported += counts.imported
+                skipped += counts.skipped
+            } else if importFile(child, into: dest, vault: vault) {
+                imported += 1
+            } else {
+                skipped += 1
+            }
+        }
+
+        if imported == 0 {
+            try? FileManager.default.removeItem(at: dest)
+        }
+        return (imported, skipped)
+    }
+
+    private static func importSummary(imported: Int, skipped: Int) -> String? {
+        switch (imported, skipped) {
+        case (0, 0): return nil
+        case (0, let s): return "Nothing imported — \(s) unsupported file\(s == 1 ? "" : "s")"
+        case (let i, 0): return "Imported \(i) file\(i == 1 ? "" : "s")"
+        case (let i, let s): return "Imported \(i) file\(i == 1 ? "" : "s"), skipped \(s) unsupported"
+        }
     }
 
     private func uniqueURL(in parent: URL, stem: String, ext: String, skipping: URL? = nil) -> URL {
@@ -556,7 +710,7 @@ public final class VaultManager: ObservableObject {
         ) else { return [] }
 
         var items: [FileItem] = []
-        for fileURL in contents.sorted(by: { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }) {
+        for fileURL in treeOrder.sorted(contents, in: url) {
             let resourceValues = try? fileURL.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey])
             let isDir = resourceValues?.isDirectory ?? false
             let modDate = resourceValues?.contentModificationDate

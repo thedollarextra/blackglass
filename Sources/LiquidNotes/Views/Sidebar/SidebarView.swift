@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 public struct SidebarView: View {
     @ObservedObject var vaultManager: VaultManager
@@ -94,14 +95,7 @@ public struct SidebarView: View {
                                         windowState.renamingID = nil
                                     },
                                     onCancelRename: { windowState.renamingID = nil },
-                                    onMove: { sources, destination in
-                                        let items = sources.compactMap { vaultManager.findInTree(id: $0.standardizedFileURL.path) }
-                                        let remap = vaultManager.moveItems(items, to: destination)
-                                        windowState.remap(remap)
-                                    },
-                                    onImport: { sources, destination in
-                                        vaultManager.importFiles(sources, into: destination)
-                                    }
+                                    vaultManager: vaultManager
                                 )
                                 .id(row.id)
                             }
@@ -123,17 +117,9 @@ public struct SidebarView: View {
                     // Empty space below the last row: drop here to move an
                     // item back to the vault's top level, or drop files from
                     // Finder here to import them into the vault's root.
-                    .onDrop(of: [.plainText, .fileURL], isTargeted: nil) { providers in
-                        guard let active = vaultManager.activeVault else { return false }
-                        return handleDrop(providers, destination: active.url) { sources, destination in
-                            let items = sources.compactMap { vaultManager.findInTree(id: $0.standardizedFileURL.path) }
-                            let remap = vaultManager.moveItems(items, to: destination)
-                            windowState.remap(remap)
-                        } onImport: { sources, destination in
-                            vaultManager.importFiles(sources, into: destination)
-                        }
-                    }
+                    .modifier(RootDropTarget(vaultManager: vaultManager, windowState: windowState))
                 }
+                .blocksWindowDrag()
                 .modifier(TrafficLightScrollEdge())
                 .onChange(of: windowState.renamingID) { _, id in
                     if let id {
@@ -183,6 +169,25 @@ public struct SidebarView: View {
                 .padding(.vertical, 8)
                 .background(.ultraThinMaterial)
                 .onExitCommand(perform: closeSearch)
+            }
+
+            // A drop that imported nothing used to look identical to one that
+            // worked, so say what actually happened.
+            if let summary = vaultManager.lastImportSummary {
+                Text(summary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.ultraThinMaterial)
+                    .transition(.opacity)
+                    .task(id: summary) {
+                        try? await Task.sleep(nanoseconds: 4_000_000_000)
+                        guard !Task.isCancelled else { return }
+                        vaultManager.lastImportSummary = nil
+                    }
             }
 
             Divider().opacity(0.3)
@@ -286,8 +291,22 @@ public struct SidebarView: View {
                             .foregroundStyle(windowState.isSearching ? Color.accentColor : Color.primary)
                     }
                     .buttonStyle(.plain)
-                    .help(windowState.isSearching ? "Close Search (Esc)" : "Search Notes (⌃F)")
+                    .help(windowState.isSearching
+                          ? "Close Search (Esc)"
+                          : (settingsStore.settings.commandKSearch == .sidebar
+                             ? "Search Notes (⌃F, ⌘K)"
+                             : "Search Notes (⌃F)"))
                 }
+
+                Button(action: { windowState.showOmnibar.toggle() }) {
+                    Image(systemName: "magnifyingglass.circle")
+                        .font(.body)
+                        .foregroundStyle(windowState.showOmnibar ? Color.accentColor : Color.primary)
+                }
+                .buttonStyle(.plain)
+                .help(settingsStore.settings.commandKSearch == .omnisearch
+                      ? "Omnisearch (⌘K)"
+                      : "Omnisearch")
 
                 Button(action: { windowState.showGraph.toggle() }) {
                     Image(systemName: "point.3.connected.trianglepath.dotted")
@@ -430,44 +449,242 @@ public struct SidebarView: View {
     }
 }
 
-/// Dispatches a drop to `onMove` (this app's own newline-joined-paths
-/// payload, used for internal drag-to-move within the sidebar) or `onImport`
-/// (one or more real file URLs — dragged in from Finder or anywhere else
-/// outside the app). Checked in that order: a Finder file is always loadable
-/// as a URL, while this app's own drag payload never is (it's a plain
-/// string), so URL-loadability alone tells the two apart unambiguously.
-/// Shared by every drop target in the sidebar (folder rows and the empty
-/// area below the tree, which drops back to the vault root).
-func handleDrop(
-    _ providers: [NSItemProvider],
-    destination: URL,
-    onMove: @escaping @Sendable @MainActor ([URL], URL) -> Void,
-    onImport: @escaping @Sendable @MainActor ([URL], URL) -> Void
-) -> Bool {
-    let fileProviders = providers.filter { $0.canLoadObject(ofClass: URL.self) }
-    if !fileProviders.isEmpty {
-        // Loaded one at a time (rather than an async Task awaiting an array
-        // of them) so nothing but the final, Sendable-safe `[URL]` ever
-        // crosses into the `@MainActor` closure that hands off to `onImport`.
-        loadFileURLs(fileProviders) { urls in
-            guard !urls.isEmpty else { return }
+/// Every drop target in the tree — folder rows, file rows (which land in the
+/// containing folder), and the area below the tree (the vault root).
+///
+/// A `DropDelegate` rather than `onDrop(of:isTargeted:)` because only a
+/// delegate gets `validateDrop`. Without it the system lights up any target
+/// that merely accepts the *type*, so dropping a folder into its own
+/// descendant looked perfectly legal and then silently did nothing.
+struct TreeDropDelegate: DropDelegate {
+    /// The folder the drop lands in — for a file row, its parent.
+    let destination: URL
+    let vaultManager: VaultManager
+    let windowState: WindowState
+    /// The row this target belongs to, if any. `nil` for the area below the
+    /// tree, which only ever appends at the vault root.
+    var row: FileItem?
+    var rowHeight: CGFloat = 28
+
+    /// Where in a row the cursor is: near an edge means "put it between these
+    /// two rows", the middle of a folder means "put it inside".
+    enum Zone {
+        case before
+        case into
+        case after
+    }
+
+    /// A file row has no inside, so it splits cleanly in half; a folder keeps
+    /// a generous middle so dropping *into* it stays the easy target.
+    private func zone(_ info: DropInfo) -> Zone {
+        guard let row else { return .into }
+        let y = info.location.y
+        guard row.isDirectory else { return y < rowHeight / 2 ? .before : .after }
+        let edge = max(4, min(8, rowHeight * 0.25))
+        if y < edge { return .before }
+        if y > rowHeight - edge { return .after }
+        return .into
+    }
+
+    /// Siblings of `row`, in the order the tree shows them.
+    private var siblings: [FileItem] {
+        guard let row else { return [] }
+        let parent = row.url.deletingLastPathComponent().standardizedFileURL
+        if parent.path == vaultManager.activeVault?.url.standardizedFileURL.path {
+            return vaultManager.fileTree
+        }
+        return vaultManager.findInTree(id: parent.path)?.children ?? []
+    }
+
+    /// Folder the drop actually lands in, given where in the row it is.
+    /// A file row's `destination` is already its parent, and `zone` never
+    /// returns `.into` for one, so both branches agree there.
+    private func resolvedDestination(_ info: DropInfo) -> URL {
+        guard let row else { return destination }
+        switch zone(info) {
+        case .into: return destination
+        case .before, .after: return row.url.deletingLastPathComponent()
+        }
+    }
+
+    /// The name the dragged items should be placed in front of — nil appends.
+    private func insertBeforeName(_ info: DropInfo) -> String? {
+        guard let row else { return nil }
+        switch zone(info) {
+        case .into: return nil
+        case .before: return row.name
+        case .after:
+            let names = siblings.map(\.name)
+            guard let i = names.firstIndex(of: row.name), i + 1 < names.count else { return nil }
+            return names[i + 1]
+        }
+    }
+
+    /// Rejected outright so a drop of photos or apps shows a "no" cursor
+    /// rather than a welcoming highlight that imports nothing. Deliberately a
+    /// blocklist: a `.md` file's UTI depends on which apps are installed —
+    /// it can arrive as plain text, as `net.daringfireball.markdown`, or as
+    /// bare `public.data` — so an allowlist would reject real notes. Anything
+    /// that slips through still meets the extension check in `importFiles`,
+    /// which now reports what it skipped.
+    private static let rejectedTypes: [UTType] = [.image, .movie, .audio, .application, .archive, .pdf]
+    private static let textLikeTypes: [UTType] = [.plainText, .text, .folder]
+
+    func validateDrop(info: DropInfo) -> Bool {
+        // Our own payload settles it: the drag carries the real file too, so
+        // "has a file URL" no longer means the drag came from outside.
+        if !info.hasItemsConforming(to: [TreeDragPayload.type]) {
+            if info.hasItemsConforming(to: [.fileURL]) {
+                if !info.hasItemsConforming(to: Self.textLikeTypes),
+                   info.hasItemsConforming(to: Self.rejectedTypes) {
+                    return false
+                }
+                return true
+            }
+        }
+        if !windowState.draggingIDs.isEmpty {
+            // A reorder within a folder is legal even though the file doesn't
+            // go anywhere on disk, so only an into-drop has to clear the
+            // same-folder no-op bar.
+            let dest = resolvedDestination(info)
+            if zone(info) != .into, let row, !windowState.draggingIDs.contains(row.id) {
+                return windowState.draggingIDs.contains { canAccept(id: $0, into: dest, allowSameFolder: true) }
+            }
+            return windowState.draggingIDs.contains { canAccept(id: $0, into: dest, allowSameFolder: false) }
+        }
+        // A drag from another window: its IDs live in that window's state, so
+        // legality can't be settled here. `moveItems` refuses illegal moves
+        // anyway once the payload resolves.
+        return info.hasItemsConforming(to: [TreeDragPayload.type])
+    }
+
+    /// Also where the hover feedback is decided: `dropEntered` only fires
+    /// once, but which zone the cursor is in changes as it moves down a row.
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        // Assigned only on an actual change: this fires on every mouse move,
+        // and republishing the same value would redraw the whole tree each
+        // time the cursor twitched.
+        switch zone(info) {
+        case .into:
+            let id = resolvedDestination(info).standardizedFileURL.path
+            if windowState.dropInsertion != nil { windowState.dropInsertion = nil }
+            if windowState.dropTargetFolderID != id { windowState.dropTargetFolderID = id }
+        case .before, .after:
+            let insertion = row.map {
+                WindowState.DropInsertion(rowID: $0.id, below: zone(info) == .after)
+            }
+            if windowState.dropTargetFolderID != nil { windowState.dropTargetFolderID = nil }
+            if windowState.dropInsertion != insertion { windowState.dropInsertion = insertion }
+        }
+        // Internal drags are moves, not copies — without this the system
+        // shows a "+" copy badge for something that doesn't copy.
+        return DropProposal(operation: info.hasItemsConforming(to: [.fileURL]) ? .copy : .move)
+    }
+
+    func dropEntered(info: DropInfo) {
+        let id = destination.standardizedFileURL.path
+        windowState.dropTargetFolderID = id
+        // Spring-loaded folders: hold a drag over a collapsed folder and it
+        // opens, so reaching a subfolder doesn't mean dropping, expanding,
+        // and picking the drag back up.
+        guard windowState.collapsedFolderIDs.contains(id) else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+            guard windowState.dropTargetFolderID == id else { return }
+            windowState.collapsedFolderIDs.remove(id)
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        if windowState.dropTargetFolderID == destination.standardizedFileURL.path {
+            windowState.dropTargetFolderID = nil
+        }
+        if let row, windowState.dropInsertion?.rowID == row.id {
+            windowState.dropInsertion = nil
+        }
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        windowState.dropTargetFolderID = nil
+        windowState.dropInsertion = nil
+        let destination = resolvedDestination(info)
+        let beforeName = insertBeforeName(info)
+        let vaultManager = self.vaultManager
+        let windowState = self.windowState
+
+        let internalProviders = info.itemProviders(for: [TreeDragPayload.type])
+        let fileProviders = internalProviders.isEmpty
+            ? info.itemProviders(for: [.fileURL]).filter { $0.canLoadObject(ofClass: URL.self) }
+            : []
+        if !fileProviders.isEmpty {
+            // Loaded one at a time (rather than an async Task awaiting an
+            // array of them) so nothing but the final, Sendable-safe `[URL]`
+            // ever crosses into the `@MainActor` closure below.
+            loadFileURLs(fileProviders) { urls in
+                guard !urls.isEmpty else { return }
+                Task { @MainActor in
+                    vaultManager.importFiles(urls, into: destination)
+                }
+            }
+            return true
+        }
+
+        guard let provider = internalProviders.first else { return false }
+        provider.loadDataRepresentation(forTypeIdentifier: TreeDragPayload.type.identifier) { data, _ in
+            guard let data else { return }
+            let ids = TreeDragPayload.decode(data)
+            guard !ids.isEmpty else { return }
             Task { @MainActor in
-                onImport(urls, destination)
+                windowState.draggingIDs = []
+                let items = ids.compactMap { vaultManager.findInTree(id: $0) }
+                windowState.remap(vaultManager.reorderItems(items, into: destination, before: beforeName))
             }
         }
         return true
     }
 
-    guard let provider = providers.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else { return false }
-    _ = provider.loadObject(ofClass: NSString.self) { value, _ in
-        guard let text = value as? String else { return }
-        let urls = text.split(separator: "\n").map { URL(fileURLWithPath: String($0)) }
-        guard !urls.isEmpty else { return }
-        Task { @MainActor in
-            onMove(urls, destination)
-        }
+    /// Whether one dragged item could actually land here — the same three
+    /// refusals `moveItems` makes, checked up front so an illegal target
+    /// never highlights in the first place.
+    private func canAccept(id: String, into destination: URL, allowSameFolder: Bool) -> Bool {
+        let source = URL(fileURLWithPath: id).standardizedFileURL
+        let dest = destination.standardizedFileURL
+        guard source.path != dest.path else { return false }
+        guard !dest.path.hasPrefix(source.path + "/") else { return false }
+        return allowSameFolder || source.deletingLastPathComponent().path != dest.path
     }
-    return true
+}
+
+/// The tree's own drag payload: the dragged rows' IDs, which are absolute
+/// paths. JSON rather than newline-joined text because `\n` is legal in a
+/// macOS filename and one such name corrupted the whole payload.
+enum TreeDragPayload {
+    /// A type of our own, declared in Info.plist, rather than plain text.
+    /// The drag also carries the real file so it can be dropped into Finder
+    /// or Mail — which means "is this a file URL?" no longer distinguishes an
+    /// internal move from an external import, and this does.
+    static let type = UTType(exportedAs: "com.liquidnotes.tree-items", conformingTo: .data)
+
+    static func encode(_ ids: [String]) -> Data {
+        (try? JSONEncoder().encode(ids)) ?? Data()
+    }
+
+    static func decode(_ data: Data) -> [String] {
+        (try? JSONDecoder().decode([String].self, from: data)) ?? []
+    }
+
+    /// What a drag from the tree carries: our own item list, plus the file
+    /// itself so other apps get something useful. Only the first file, since
+    /// SwiftUI's `onDrag` allows one provider per row — a multi-row drag still
+    /// moves everything *inside* the app, where the item list is what counts.
+    static func provider(for ids: [String], primary: URL) -> NSItemProvider {
+        let provider = NSItemProvider(contentsOf: primary) ?? NSItemProvider()
+        let payload = encode(ids)
+        provider.registerDataRepresentation(forTypeIdentifier: type.identifier, visibility: .ownProcess) { completion in
+            completion(payload, nil)
+            return nil
+        }
+        return provider
+    }
 }
 
 /// Loads each provider's `URL` one at a time (not concurrently), threading
@@ -538,10 +755,21 @@ public struct TreeRowView: View {
     var onDelete: (FileItem) -> Void
     var onRename: (FileItem, String, Bool) -> Void
     var onCancelRename: () -> Void
-    var onMove: @Sendable @MainActor ([URL], URL) -> Void
-    var onImport: @Sendable @MainActor ([URL], URL) -> Void
+    @ObservedObject var vaultManager: VaultManager
     @State private var draftName = ""
-    @State private var isDropTargeted = false
+    @State private var rowHeight: CGFloat = 28
+
+    /// A drop lands in this row's folder — either because the cursor is on
+    /// the folder itself, or on one of the files inside it.
+    private var isDropTargeted: Bool {
+        item.isDirectory && windowState.dropTargetFolderID == item.id
+    }
+
+    /// An insertion line is being drawn against this row, and on which edge.
+    private var insertionEdge: Alignment? {
+        guard let insertion = windowState.dropInsertion, insertion.rowID == item.id else { return nil }
+        return insertion.below ? .bottom : .top
+    }
 
     /// Width reserved for a folder's disclosure chevron. Files reserve the
     /// same width with an invisible spacer, so a file's icon lands in the
@@ -577,8 +805,19 @@ public struct TreeRowView: View {
     /// What a drag from this row carries: the whole selection if this row is
     /// part of a multi-selection, otherwise just this row.
     private func dragProvider() -> NSItemProvider {
-        let ids = isSelected && windowState.selection.count > 1 ? windowState.selection : [item.id]
-        return NSItemProvider(object: ids.joined(separator: "\n") as NSString)
+        // Sorted so a multi-item drag is deterministic — `selection` is a Set,
+        // and its order decided which item won a " 2" suffix on a collision.
+        let ids = (isSelected && windowState.selection.count > 1
+                   ? Array(windowState.selection)
+                   : [item.id]).sorted()
+        // Published as well as carried in the payload: `validateDrop` has to
+        // answer synchronously and can't read the payload.
+        windowState.draggingIDs = ids
+        // A drag cancelled outside any target never reports an exit, so clear
+        // any highlight left over from last time rather than stranding it.
+        windowState.dropTargetFolderID = nil
+        windowState.dropInsertion = nil
+        return TreeDragPayload.provider(for: ids, primary: item.url)
     }
 
     public var body: some View {
@@ -654,14 +893,47 @@ public struct TreeRowView: View {
                 Button("Collapse All") {
                     windowState.collapsedFolderIDs.formUnion(item.folderIDsInSubtree)
                 }
+                if vaultManager.hasManualOrder(item.url) {
+                    Button("Sort by Name") {
+                        vaultManager.clearManualOrder(of: item.url)
+                    }
+                }
             }
             Divider()
             Button("Move to Trash", role: .destructive) {
                 onDelete(item)
             }
         }
-        .onDrag(dragProvider)
-        .modifier(DropIfDirectory(isDirectory: item.isDirectory, destination: item.url, isTargeted: $isDropTargeted, onMove: onMove, onImport: onImport))
+        .background {
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { rowHeight = geo.size.height }
+                    .onChange(of: geo.size.height) { _, height in rowHeight = height }
+            }
+        }
+        .overlay(alignment: insertionEdge ?? .top) {
+            if insertionEdge != nil {
+                Capsule()
+                    .fill(Color.accentColor)
+                    .frame(height: 2)
+                    .padding(.leading, CGFloat(depth) * Self.indentUnit + Self.chevronWidth)
+                    .allowsHitTesting(false)
+            }
+        }
+        // Not while renaming, or the text field being typed into can be
+        // dragged out from under the cursor.
+        .modifier(DraggableUnlessRenaming(isRenaming: isRenaming, provider: dragProvider))
+        // Every row is a target, not just folders: dropping onto a note puts
+        // the item in that note's folder. Previously file rows had no target
+        // at all, so the drop fell through to the container and silently
+        // moved the item to the vault root from anywhere in the tree.
+        .onDrop(of: [TreeDragPayload.type, .fileURL], delegate: TreeDropDelegate(
+            destination: item.isDirectory ? item.url : item.url.deletingLastPathComponent(),
+            vaultManager: vaultManager,
+            windowState: windowState,
+            row: item,
+            rowHeight: rowHeight
+        ))
     }
 
     @ViewBuilder
@@ -677,21 +949,43 @@ public struct TreeRowView: View {
     }
 }
 
-/// Only folders accept drops. Kept as a separate modifier (rather than an
-/// `if` inline in `body`) so `.onDrop`'s `isTargeted` binding isn't attached
-/// and detached as a row toggles between file and folder rendering.
-private struct DropIfDirectory: ViewModifier {
-    let isDirectory: Bool
-    let destination: URL
-    @Binding var isTargeted: Bool
-    var onMove: @Sendable @MainActor ([URL], URL) -> Void
-    var onImport: @Sendable @MainActor ([URL], URL) -> Void
+private struct DraggableUnlessRenaming: ViewModifier {
+    let isRenaming: Bool
+    let provider: () -> NSItemProvider
 
     func body(content: Content) -> some View {
-        if isDirectory {
-            content.onDrop(of: [.plainText, .fileURL], isTargeted: $isTargeted) { providers in
-                handleDrop(providers, destination: destination, onMove: onMove, onImport: onImport)
-            }
+        if isRenaming {
+            content
+        } else {
+            content.onDrag(provider)
+        }
+    }
+}
+
+/// Drops onto the area below the tree, which land at the vault's top level.
+/// A modifier rather than an inline `if` so the target isn't attached and
+/// detached as the active vault changes.
+private struct RootDropTarget: ViewModifier {
+    @ObservedObject var vaultManager: VaultManager
+    @ObservedObject var windowState: WindowState
+
+    func body(content: Content) -> some View {
+        if let active = vaultManager.activeVault {
+            content
+                .onDrop(of: [TreeDragPayload.type, .fileURL], delegate: TreeDropDelegate(
+                    destination: active.url,
+                    vaultManager: vaultManager,
+                    windowState: windowState
+                ))
+                .overlay {
+                    // The root has no row of its own to light up.
+                    if windowState.dropTargetFolderID == active.url.standardizedFileURL.path {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(Color.accentColor.opacity(0.55), lineWidth: 1.5)
+                            .padding(.horizontal, 4)
+                            .allowsHitTesting(false)
+                    }
+                }
         } else {
             content
         }
