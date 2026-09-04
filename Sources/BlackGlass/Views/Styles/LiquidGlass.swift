@@ -318,7 +318,7 @@ final class WindowChromeView: NSView {
 
     func applyChrome() {
         guard let window else { return }
-        configureLiquidNotesWindow(window)
+        configureBlackGlassWindow(window)
     }
 }
 
@@ -373,17 +373,17 @@ extension NSUserInterfaceItemIdentifier {
     /// `MenuBarController` find a main window to surface even while note
     /// windows are also open, since both kinds share the same hidden-titlebar
     /// chrome and `canBecomeMain`.
-    static let liquidNotesMainWindow = NSUserInterfaceItemIdentifier("LiquidNotes.mainWindow")
+    static let blackGlassMainWindow = NSUserInterfaceItemIdentifier("BlackGlass.mainWindow")
 }
 
 public extension View {
-    /// Tags the window this view lands in as a main LiquidNotes window.
+    /// Tags the window this view lands in as a main BlackGlass window.
     /// Apply once, to the root of the main WindowGroup's content. Pass
     /// `false` for a popped-out single-note window, which shares this same
     /// view but shouldn't be found by `MenuBarController`'s main-window
     /// lookup.
     @ViewBuilder
-    func tagAsLiquidNotesMainWindow(_ isMain: Bool = true) -> some View {
+    func tagAsBlackGlassMainWindow(_ isMain: Bool = true) -> some View {
         if isMain {
             background(MainWindowTagger())
         } else {
@@ -400,12 +400,12 @@ private struct MainWindowTagger: NSViewRepresentable {
 private final class TaggingView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        window?.identifier = .liquidNotesMainWindow
+        window?.identifier = .blackGlassMainWindow
     }
 }
 
 @MainActor
-func configureLiquidNotesWindow(_ window: NSWindow) {
+func configureBlackGlassWindow(_ window: NSWindow) {
     window.titleVisibility = .hidden
     window.titlebarAppearsTransparent = true
     window.titlebarSeparatorStyle = .none

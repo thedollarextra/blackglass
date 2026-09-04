@@ -2,17 +2,17 @@
 import PackageDescription
 
 let package = Package(
-    name: "LiquidNotes",
+    name: "BlackGlass",
     platforms: [
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "LiquidNotes", targets: ["LiquidNotes"])
+        .executable(name: "BlackGlass", targets: ["BlackGlass"])
     ],
     targets: [
         .executableTarget(
-            name: "LiquidNotes",
-            path: "Sources/LiquidNotes",
+            name: "BlackGlass",
+            path: "Sources/BlackGlass",
             resources: [
                 .copy("Web")
             ]

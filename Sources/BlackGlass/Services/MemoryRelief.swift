@@ -7,7 +7,7 @@ import AppKit
 /// The search index stays resident because `/api/search` needs it, but
 /// everything the UI accumulated — WebKit's caches, rendered images, the
 /// allocator's free pages — can go back.
-public enum LiquidNotesMemory {
+public enum BlackGlassMemory {
     /// Called when the last window closes, and from Settings' Release Memory.
     public static func releaseIdle() {
         URLCache.shared.removeAllCachedResponses()

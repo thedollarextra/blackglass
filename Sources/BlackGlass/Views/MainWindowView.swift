@@ -12,7 +12,7 @@ struct MainWindowView: View {
     @StateObject private var windowState: WindowState
     /// Whether this instance is a popped-out single-note window rather than
     /// the app's real main window — both are the same view, but only the
-    /// real one should be tagged `.liquidNotesMainWindow` (see
+    /// real one should be tagged `.blackGlassMainWindow` (see
     /// `MenuBarController.reallyShowMainWindow()`, which looks for that tag
     /// specifically so it doesn't surface/reuse a note pop-out instead).
     private let isPopOut: Bool
@@ -134,7 +134,7 @@ struct MainWindowView: View {
         .ignoresSafeArea()
         .animation(.easeInOut(duration: 0.18), value: windowState.showOmnibar)
         .hidesTitlebarFill()
-        .tagAsLiquidNotesMainWindow(!isPopOut)
+        .tagAsBlackGlassMainWindow(!isPopOut)
         .focusedSceneValue(\.windowState, windowState)
         .onAppear {
             settingsStore.settings.appearance.applyToApp()
@@ -145,7 +145,7 @@ struct MainWindowView: View {
             // for every window on every window's appearance was O(open
             // windows) of redundant work each time any one of them appeared.
             server.attach(vaultManager: vaultManager)
-            // `openWindowAction` is set from `LiquidNotesApp.body` instead of
+            // `openWindowAction` is set from `BlackGlassApp.body` instead of
             // here — this `.onAppear` never runs at all when the app
             // launches with zero windows restored, which would leave it
             // permanently unset for the rest of that launch.

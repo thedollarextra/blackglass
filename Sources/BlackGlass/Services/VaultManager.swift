@@ -35,6 +35,8 @@ public final class VaultManager: ObservableObject {
     let wikiIndex = WikiIndex()
     public let indexer: IndexCoordinator
     private let configURL: URL
+    /// Deliberately still the old name — it's a UserDefaults key, and
+    /// renaming it would forget which vault an existing install had open.
     private let lastVaultKey = "LiquidNotes.activeVaultID"
 
     /// Last graph built per vault. `GraphView` is torn down and rebuilt every
@@ -62,10 +64,7 @@ public final class VaultManager: ObservableObject {
 
     public init() {
         self.indexer = IndexCoordinator(search: searchIndex, wiki: wikiIndex)
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let appFolder = appSupport.appendingPathComponent("LiquidNotes", isDirectory: true)
-        try? FileManager.default.createDirectory(at: appFolder, withIntermediateDirectories: true)
-        self.configURL = appFolder.appendingPathComponent("vaults.json")
+        self.configURL = AppSupport.folder.appendingPathComponent("vaults.json")
 
         loadVaults()
         ensureDefaultVaultIfNeeded()
@@ -148,7 +147,7 @@ public final class VaultManager: ObservableObject {
     }
 
     /// Sidebar refresh: reload the tree and re-scan from disk, for edits made
-    /// outside LiquidNotes.
+    /// outside BlackGlass.
     public func refreshAll() {
         invalidateGraphCache()
         refreshFileTree()
@@ -168,7 +167,7 @@ public final class VaultManager: ObservableObject {
         indexer.clear()
         fileTree = []
         indexSuspended = true
-        LiquidNotesMemory.releaseIdle()
+        BlackGlassMemory.releaseIdle()
     }
 
     public func resumeIndexIfSuspended() {
@@ -341,7 +340,7 @@ public final class VaultManager: ObservableObject {
                 do {
                     try FileManager.default.moveItem(at: item.url, to: dest)
                 } catch {
-                    NSLog("LiquidNotes rename failed: \(error.localizedDescription)")
+                    NSLog("BlackGlass rename failed: \(error.localizedDescription)")
                     dest = item.url
                 }
             }
@@ -353,7 +352,7 @@ public final class VaultManager: ObservableObject {
                 do {
                     try FileManager.default.moveItem(at: item.url, to: dest)
                 } catch {
-                    NSLog("LiquidNotes rename failed: \(error.localizedDescription)")
+                    NSLog("BlackGlass rename failed: \(error.localizedDescription)")
                     dest = item.url
                 }
             }
@@ -372,7 +371,7 @@ public final class VaultManager: ObservableObject {
         refreshFileTree()
         if focusEditor && !item.isDirectory {
             DispatchQueue.main.async {
-                NotificationCenter.default.post(name: .liquidNotesFocusEditor, object: nil)
+                NotificationCenter.default.post(name: .blackGlassFocusEditor, object: nil)
             }
         }
         return FileItem(url: dest, isDirectory: item.isDirectory)
@@ -404,7 +403,7 @@ public final class VaultManager: ObservableObject {
                 do {
                     try FileManager.default.moveItem(at: source, to: dest)
                 } catch {
-                    NSLog("LiquidNotes move failed: \(error.localizedDescription)")
+                    NSLog("BlackGlass move failed: \(error.localizedDescription)")
                     continue
                 }
                 for (note, relative) in zip(movedNotes, relativePaths) {
@@ -426,7 +425,7 @@ public final class VaultManager: ObservableObject {
                 do {
                     try FileManager.default.moveItem(at: source, to: dest)
                 } catch {
-                    NSLog("LiquidNotes move failed: \(error.localizedDescription)")
+                    NSLog("BlackGlass move failed: \(error.localizedDescription)")
                     continue
                 }
                 indexer.noteMoved(from: source, to: dest, vault: active.url)
@@ -555,7 +554,7 @@ public final class VaultManager: ObservableObject {
         do {
             try FileManager.default.copyItem(at: source, to: dest)
         } catch {
-            NSLog("LiquidNotes import failed: \(error.localizedDescription)")
+            NSLog("BlackGlass import failed: \(error.localizedDescription)")
             return false
         }
         indexer.noteAdded(url: dest, vault: vault)
@@ -672,7 +671,7 @@ public final class VaultManager: ObservableObject {
             do {
                 try FileManager.default.trashItem(at: item.url, resultingItemURL: &trashedURL)
             } catch {
-                NSLog("LiquidNotes delete failed: \(error.localizedDescription)")
+                NSLog("BlackGlass delete failed: \(error.localizedDescription)")
                 continue
             }
             guard let trashed = trashedURL as URL? else { continue }
@@ -690,7 +689,7 @@ public final class VaultManager: ObservableObject {
             do {
                 try FileManager.default.moveItem(at: entry.trashed, to: entry.original)
             } catch {
-                NSLog("LiquidNotes undo failed: \(error.localizedDescription)")
+                NSLog("BlackGlass undo failed: \(error.localizedDescription)")
                 continue
             }
             if entry.isDirectory {
@@ -737,13 +736,13 @@ public final class VaultManager: ObservableObject {
     private func ensureDefaultVaultIfNeeded() {
         if vaults.isEmpty {
             let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-            let defaultVaultPath = docs.appendingPathComponent("LiquidNotes Vault", isDirectory: true)
+            let defaultVaultPath = docs.appendingPathComponent("BlackGlass Vault", isDirectory: true)
             try? FileManager.default.createDirectory(at: defaultVaultPath, withIntermediateDirectories: true)
 
-            let sampleNote = defaultVaultPath.appendingPathComponent("Welcome to LiquidNotes.md")
+            let sampleNote = defaultVaultPath.appendingPathComponent("Welcome to BlackGlass.md")
             if !FileManager.default.fileExists(atPath: sampleNote.path) {
                 let sampleContent = """
-                # Welcome to LiquidNotes 💧
+                # Welcome to BlackGlass 💧
 
                 A lightweight, 2-pane notebook with a Liquid Glass visual aesthetic.
 

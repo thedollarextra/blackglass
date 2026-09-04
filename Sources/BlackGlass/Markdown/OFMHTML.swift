@@ -353,7 +353,7 @@ enum OFMHTML {
 
     private static func wikiHref(_ rel: String, web: Bool) -> String {
         if web { return "#note=\(rel)" }
-        return "liquidnotes://note?path=\(rel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? rel)"
+        return "blackglass://note?path=\(rel.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? rel)"
     }
 
     private static func mediaSrc(_ url: String, ctx: Context) -> String {

@@ -18,10 +18,7 @@ final class TreeOrderStore {
     private let url: URL
 
     init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let folder = appSupport.appendingPathComponent("LiquidNotes", isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        url = folder.appendingPathComponent("tree-order.json")
+        url = AppSupport.folder.appendingPathComponent("tree-order.json")
         if let data = try? Data(contentsOf: url),
            let decoded = try? JSONDecoder().decode([String: [String]].self, from: data) {
             order = decoded

@@ -275,7 +275,7 @@ struct IndexSettingsView: View {
     @ObservedObject var indexer: IndexCoordinator
     /// Drives the estimate and elapsed readouts while a rebuild is running.
     @State private var now = Date()
-    @State private var footprint = LiquidNotesMemory.footprint()
+    @State private var footprint = BlackGlassMemory.footprint()
 
     private static let timer = Timer.publish(every: 0.5, on: .main, in: .common).autoconnect()
 
@@ -366,9 +366,9 @@ struct IndexSettingsView: View {
                     }
                     Spacer()
                     Button("Release Memory") {
-                        LiquidNotesMemory.releaseIdle()
+                        BlackGlassMemory.releaseIdle()
                         indexer.refreshStats()
-                        footprint = LiquidNotesMemory.footprint()
+                        footprint = BlackGlassMemory.footprint()
                     }
                 }
                 Text("Notes are re-indexed as you edit them. A full rebuild is only needed if files changed outside BlackGlass.")
@@ -379,10 +379,10 @@ struct IndexSettingsView: View {
         }
         .formStyle(.grouped)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .onAppear { footprint = LiquidNotesMemory.footprint() }
+        .onAppear { footprint = BlackGlassMemory.footprint() }
         .onReceive(Self.timer) { date in
             if indexer.status.isRunning { now = date }
-            footprint = LiquidNotesMemory.footprint()
+            footprint = BlackGlassMemory.footprint()
         }
     }
 

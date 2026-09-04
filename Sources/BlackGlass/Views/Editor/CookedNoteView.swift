@@ -80,7 +80,7 @@ struct CookedNoteView: NSViewRepresentable {
                 decisionHandler(.allow)
                 return
             }
-            if url.scheme == "liquidnotes" {
+            if url.scheme == "blackglass" {
                 decisionHandler(.cancel)
                 let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                     .queryItems?.first(where: { $0.name == "path" })?.value

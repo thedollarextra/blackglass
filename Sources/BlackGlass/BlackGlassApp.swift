@@ -3,7 +3,7 @@ import AppKit
 import Carbon
 
 @main
-struct LiquidNotesApp: App {
+struct BlackGlassApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.openWindow) private var openWindow
     @StateObject private var vaultManager = VaultManager()
@@ -20,7 +20,7 @@ struct LiquidNotesApp: App {
         // app with zero windows restored (e.g. it was last quit with none
         // open), in which case that view's content closure never runs and
         // never gets a chance to register this — permanently breaking the
-        // menu bar's "Open LiquidNotes" item for the rest of that launch,
+        // menu bar's "Open BlackGlass" item for the rest of that launch,
         // since its fallback had nothing to call. `body` itself always runs
         // at launch regardless of window count, and `openWindow` is already
         // valid here (the "New Window" command below already reads it the
@@ -73,12 +73,12 @@ struct LiquidNotesApp: App {
                 .disabled(windowState == nil)
 
                 Button("Toggle Uncooked / Cooked") {
-                    NotificationCenter.default.post(name: .liquidNotesToggleEditor, object: nil)
+                    NotificationCenter.default.post(name: .blackGlassToggleEditor, object: nil)
                 }
                 .keyboardShortcut("e", modifiers: [.command])
 
                 Button("Find in Note") {
-                    NotificationCenter.default.post(name: .liquidNotesFindInNote, object: nil)
+                    NotificationCenter.default.post(name: .blackGlassFindInNote, object: nil)
                 }
                 .keyboardShortcut("f", modifiers: [.command])
 
@@ -128,7 +128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         SettingsStore.shared.settings.appearance.applyToApp()
         MenuBarController.shared.start()
-        NSApp.windows.forEach { configureLiquidNotesWindow($0) }
+        NSApp.windows.forEach { configureBlackGlassWindow($0) }
         // Only the status item, not the accessory/regular activation-policy
         // decision: on a fresh launch, SwiftUI's own default `WindowGroup`
         // window isn't created until the run loop actually starts (after
@@ -149,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 MenuBarController.shared.syncAppearance()
                 // Nothing is on screen now; give back what the UI accumulated.
-                LiquidNotesMemory.releaseIdle()
+                BlackGlassMemory.releaseIdle()
             }
             return false
         }

@@ -13,12 +13,12 @@ FINISHED="${FINISHED_APPS_DIR:-}"
 # Build outside the source tree. This project lives in iCloud Drive, and letting
 # SwiftPM keep intermediates in ./.build there makes every compile fight the
 # sync daemon. Override with SCRATCH_PATH.
-SCRATCH="${SCRATCH_PATH:-${TMPDIR:-/tmp}/LiquidNotes-build}"
+SCRATCH="${SCRATCH_PATH:-${TMPDIR:-/tmp}/BlackGlass-build}"
 
 echo "==> Compiling ($CONFIG) in ${SCRATCH}..."
 swift build -c "$CONFIG" --disable-sandbox --scratch-path "$SCRATCH"
 
-BIN="$(swift build -c "$CONFIG" --scratch-path "$SCRATCH" --show-bin-path)/LiquidNotes"
+BIN="$(swift build -c "$CONFIG" --scratch-path "$SCRATCH" --show-bin-path)/BlackGlass"
 if [ ! -x "$BIN" ]; then
   echo "error: binary not found at $BIN" >&2
   exit 1
@@ -31,8 +31,8 @@ STAGE="$SCRATCH/stage/$APP"
 echo "==> Assembling ${APP}..."
 rm -rf "$STAGE"
 mkdir -p "$STAGE/Contents/MacOS" "$STAGE/Contents/Resources"
-cp "$BIN" "$STAGE/Contents/MacOS/LiquidNotes"
-chmod +x "$STAGE/Contents/MacOS/LiquidNotes"
+cp "$BIN" "$STAGE/Contents/MacOS/BlackGlass"
+chmod +x "$STAGE/Contents/MacOS/BlackGlass"
 cp Resources/Info.plist "$STAGE/Contents/Info.plist"
 
 BUILD_NUMBER="$(date +%Y%m%d%H%M)"
@@ -43,7 +43,7 @@ if [ -f Resources/AppIcon.icns ]; then
   cp Resources/AppIcon.icns "$STAGE/Contents/Resources/AppIcon.icns"
 fi
 mkdir -p "$STAGE/Contents/Resources/Web"
-cp -R Sources/LiquidNotes/Web/. "$STAGE/Contents/Resources/Web/"
+cp -R Sources/BlackGlass/Web/. "$STAGE/Contents/Resources/Web/"
 BIN_DIR="$(dirname "$BIN")"
 shopt -s nullglob
 for bundle in "$BIN_DIR"/*.bundle; do

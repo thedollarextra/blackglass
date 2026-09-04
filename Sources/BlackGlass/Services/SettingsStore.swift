@@ -131,10 +131,7 @@ final class SettingsStore: ObservableObject {
     private let url: URL
 
     private init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let folder = appSupport.appendingPathComponent("LiquidNotes", isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        url = folder.appendingPathComponent("settings.json")
+        url = AppSupport.folder.appendingPathComponent("settings.json")
         if let data = try? Data(contentsOf: url),
            let decoded = try? JSONDecoder().decode(AppSettings.self, from: data) {
             settings = decoded

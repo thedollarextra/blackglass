@@ -126,9 +126,9 @@ final class MenuBarController: NSObject, ObservableObject {
         // Only a tagged main window counts: with note pop-out windows also
         // supported now, `canBecomeMain` alone could match one of those and
         // skip surfacing (or creating) an actual main window.
-        for window in NSApp.windows where window.identifier == .liquidNotesMainWindow {
+        for window in NSApp.windows where window.identifier == .blackGlassMainWindow {
             window.makeKeyAndOrderFront(nil)
-            configureLiquidNotesWindow(window)
+            configureBlackGlassWindow(window)
             didShow = true
         }
         if !didShow {
@@ -215,6 +215,6 @@ final class MenuBarController: NSObject, ObservableObject {
 
     @objc private func openSettings(_ sender: Any?) {
         showMainWindow()
-        NotificationCenter.default.post(name: .liquidNotesOpenSettings, object: nil)
+        NotificationCenter.default.post(name: .blackGlassOpenSettings, object: nil)
     }
 }

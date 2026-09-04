@@ -676,7 +676,7 @@ enum TreeDragPayload {
     /// The drag also carries the real file so it can be dropped into Finder
     /// or Mail — which means "is this a file URL?" no longer distinguishes an
     /// internal move from an external import, and this does.
-    static let type = UTType(exportedAs: "com.liquidnotes.tree-items", conformingTo: .data)
+    static let type = UTType(exportedAs: "com.blackglass.tree-items", conformingTo: .data)
 
     static func encode(_ ids: [String]) -> Data {
         (try? JSONEncoder().encode(ids)) ?? Data()
@@ -1007,8 +1007,8 @@ private struct RootDropTarget: ViewModifier {
 }
 
 extension Notification.Name {
-    static let liquidNotesToggleEditor = Notification.Name("liquidNotesToggleEditor")
-    static let liquidNotesFocusEditor = Notification.Name("liquidNotesFocusEditor")
-    static let liquidNotesOpenSettings = Notification.Name("liquidNotesOpenSettings")
-    static let liquidNotesFindInNote = Notification.Name("liquidNotesFindInNote")
+    static let blackGlassToggleEditor = Notification.Name("blackGlassToggleEditor")
+    static let blackGlassFocusEditor = Notification.Name("blackGlassFocusEditor")
+    static let blackGlassOpenSettings = Notification.Name("blackGlassOpenSettings")
+    static let blackGlassFindInNote = Notification.Name("blackGlassFindInNote")
 }

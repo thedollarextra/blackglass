@@ -140,14 +140,14 @@ public struct EditorView: View {
             loadContent()
         }
         .onDisappear { flushSave() }
-        .onReceive(NotificationCenter.default.publisher(for: .liquidNotesToggleEditor)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .blackGlassToggleEditor)) { _ in
             mode.toggle()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .liquidNotesFocusEditor)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .blackGlassFocusEditor)) { _ in
             mode = .uncooked
             requestFocusAtStart = true
         }
-        .onReceive(NotificationCenter.default.publisher(for: .liquidNotesFindInNote)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .blackGlassFindInNote)) { _ in
             guard mode == .uncooked else { return }
             showFind = true
             isFindFieldFocused = true
@@ -186,7 +186,7 @@ public struct EditorView: View {
             lastSaved = newText
             onContentSaved?(fileItem.url, newText)
         } catch {
-            NSLog("LiquidNotes save failed: \(error.localizedDescription)")
+            NSLog("BlackGlass save failed: \(error.localizedDescription)")
         }
     }
 }

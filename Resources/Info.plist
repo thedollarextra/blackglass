@@ -7,11 +7,11 @@
     <key>CFBundleDisplayName</key>
     <string>BlackGlass</string>
     <key>CFBundleExecutable</key>
-    <string>LiquidNotes</string>
+    <string>BlackGlass</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.liquidnotes.LiquidNotes</string>
+    <string>com.blackglass.BlackGlass</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -40,7 +40,7 @@
     <array>
         <dict>
             <key>UTTypeIdentifier</key>
-            <string>com.liquidnotes.tree-items</string>
+            <string>com.blackglass.tree-items</string>
             <key>UTTypeDescription</key>
             <string>BlackGlass sidebar items</string>
             <key>UTTypeConformsTo</key>
