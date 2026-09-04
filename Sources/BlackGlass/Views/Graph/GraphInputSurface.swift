@@ -45,6 +45,10 @@ final class GraphInputView: NSView {
     /// that the SwiftUI hierarchy handles.
     override var acceptsFirstResponder: Bool { false }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    /// The window is movable by its background, and this is a transparent
+    /// overlay — so without this a drag across the canvas slid the whole
+    /// window instead of panning the graph.
+    override var mouseDownCanMoveWindow: Bool { false }
 
     // MARK: Tracking
 
