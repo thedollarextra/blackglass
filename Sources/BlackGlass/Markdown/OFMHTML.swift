@@ -97,6 +97,55 @@ enum OFMHTML {
         return out
     }
 
+    /// A transcluded note or PDF renders as a block element, but the parser
+    /// sees an embed as inline, so it lands inside the paragraph it was
+    /// written in. No parser accepts a <div> inside a <p>: the browser closes
+    /// the paragraph before it and strands the </p> as an empty one after,
+    /// leaving the embed outside the element meant to be styling it.
+    ///
+    /// So a paragraph is split around any block-level embed — the text either
+    /// side of it becomes its own paragraph. An embedded *image* is genuinely
+    /// inline and stays where it was written.
+    private static func renderParagraph(
+        _ inlines: [OFMInline], bid: String, ctx: inout Context
+    ) -> String {
+        // Almost every paragraph has no embed at all, and transcluding one is
+        // expensive enough not to want it rendered twice to find out.
+        let hasEmbed = inlines.contains { if case .embed = $0 { return true } else { return false } }
+        if !hasEmbed {
+            return "<p\(bid)>\(renderInlines(inlines, ctx: &ctx))</p>\n"
+        }
+
+        var out = ""
+        var run: [OFMInline] = []
+        func flushRun(_ ctx: inout Context) {
+            guard !run.isEmpty else { return }
+            let html = renderInlines(run, ctx: &ctx)
+            run.removeAll()
+            guard !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            out += "<p>\(html)</p>\n"
+        }
+        for node in inlines {
+            guard case .embed = node else {
+                run.append(node)
+                continue
+            }
+            let html = renderInlines([node], ctx: &ctx)
+            guard html.hasPrefix("<div") || html.hasPrefix("<iframe") else {
+                run.append(node)
+                continue
+            }
+            flushRun(&ctx)
+            out += html + "\n"
+        }
+        flushRun(&ctx)
+        if out.isEmpty { return "<p\(bid)></p>\n" }
+        // The block id belonged to one paragraph that is now several elements,
+        // so it moves to a wrapper around them. Only a paragraph carrying both
+        // a ^block-id and an embed takes this path.
+        return bid.isEmpty ? out : "<div\(bid)>\n\(out)</div>\n"
+    }
+
     private static func renderBlock(_ block: OFMBlock, ctx: inout Context) -> String {
         switch block {
         case .heading(let level, let text, let id):
@@ -104,8 +153,7 @@ enum OFMHTML {
             let bid = id.map { " id=\"^\($0)\"" } ?? ""
             return "<h\(level) id=\"\(escapeAttr(slug))\"\(bid)>\(renderInlines(text, ctx: &ctx))</h\(level)>\n"
         case .paragraph(let text, let id):
-            let bid = id.map { " id=\"^\($0)\"" } ?? ""
-            return "<p\(bid)>\(renderInlines(text, ctx: &ctx))</p>\n"
+            return renderParagraph(text, bid: id.map { " id=\"^\($0)\"" } ?? "", ctx: &ctx)
         case .list(let ordered, let items):
             let tag = ordered ? "ol" : "ul"
             var inner = ""

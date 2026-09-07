@@ -23,13 +23,56 @@ final class NoteServer: ObservableObject {
 
     private var listener: NWListener?
     private weak var vaultManager: VaultManager?
+    /// Whether this launch has already tried to bring the server up, so the
+    /// attempt isn't repeated on every SwiftUI body evaluation.
+    private var didLaunchStart = false
+    /// What the live listener was asked for, recorded synchronously. `start`
+    /// compares against these; `isRunning` can't be used for that, because it
+    /// only becomes true once the listener reports `.ready`, well after the
+    /// call that created it returned.
+    private var requestedPort: Int?
+    private var requestedLocalhostOnly: Bool?
 
     func attach(vaultManager: VaultManager) {
         self.vaultManager = vaultManager
     }
 
+    /// Brings the server up for this launch, if the settings ask for it.
+    ///
+    /// Called from the app's `body` rather than a view's `onAppear`, because
+    /// with `menuBarMode` on the app can launch with no window at all — and
+    /// `MainWindowView.onAppear` was the only thing that ever called `start()`.
+    /// Serving the vault to a phone is much of the point of a menu-bar launch,
+    /// so it cannot depend on a window being opened first.
+    func startOnLaunch(vaultManager: VaultManager, settings: SettingsStore) {
+        guard !didLaunchStart else { return }
+        didLaunchStart = true
+        attach(vaultManager: vaultManager)
+        // Deferred by one turn of the run loop: writing `serverEnabled` back
+        // while the view tree is being evaluated is what SwiftUI warns about.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let current = settings.settings
+            guard current.serverEnabled || current.serverAutoStart else { return }
+            settings.settings.serverEnabled = true
+            self.start(port: current.serverPort, localhostOnly: current.serverLocalhostOnly)
+        }
+    }
+
     func start(port: Int, localhostOnly: Bool) {
+        // Already serving exactly this — nothing to do. Without this guard a
+        // second caller tears the listener down and immediately asks for the
+        // same port back, and `NWListener.cancel()` completes asynchronously:
+        // the replacement loses the race to the socket it just closed and dies
+        // with EADDRINUSE, leaving nothing serving at all. Two callers landing
+        // within a few hundred milliseconds of each other at launch is the
+        // normal case, not a rare one.
+        if listener != nil, requestedPort == port, requestedLocalhostOnly == localhostOnly {
+            return
+        }
         stop()
+        requestedPort = port
+        requestedLocalhostOnly = localhostOnly
         lastError = nil
         guard let nwPort = NWEndpoint.Port(rawValue: UInt16(clamping: port)) else {
             lastError = "Invalid port"
@@ -82,12 +125,14 @@ final class NoteServer: ObservableObject {
     func stop() {
         listener?.cancel()
         listener = nil
+        requestedPort = nil
+        requestedLocalhostOnly = nil
         isRunning = false
         boundPort = 0
     }
 
     func apply(_ settings: AppSettings) {
-        if settings.serverEnabled || settings.serverAutoStart && settings.serverEnabled {
+        if settings.serverEnabled {
             start(port: settings.serverPort, localhostOnly: settings.serverLocalhostOnly)
         } else {
             stop()

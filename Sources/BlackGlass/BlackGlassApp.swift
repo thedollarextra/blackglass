@@ -30,6 +30,13 @@ struct BlackGlassApp: App {
         // code, not a block component, unlike a bare assignment statement.
         let _ = (menuBar.openWindowAction = { openWindow(id: Self.mainWindowID) })
 
+        // Same reason, and the same place: a menu-bar launch can restore no
+        // windows at all, and the server used to be started only from
+        // `MainWindowView.onAppear`. With `menuBarMode` and `serverAutoStart`
+        // both on it therefore never started — the one configuration where
+        // serving to a phone matters most.
+        let _ = server.startOnLaunch(vaultManager: vaultManager, settings: settingsStore)
+
         WindowGroup("BlackGlass", id: Self.mainWindowID) {
             MainWindowView(vaultManager: vaultManager, server: server)
         }
