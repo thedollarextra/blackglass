@@ -22,6 +22,11 @@
     omniResults: [],
     omniIndex: 0,
     collapsed: new Set(),
+    /// Rows picked out for a bulk action, by path. The open note and the
+    /// selected folder are tracked separately and drawn the same way; this is
+    /// only what a shift- or cmd-click has gathered.
+    selection: new Set(),
+    selectionAnchor: null,
     graph: false,
     graphNodes: [],
     graphEdges: [],
@@ -187,6 +192,7 @@
 
   async function loadTree() {
     state.tree = await api("/api/tree");
+    pruneSelection();
     renderTree();
   }
 
@@ -220,13 +226,93 @@
     }
   }
 
+  // Rows in the order they are drawn. Read from the DOM rather than walked
+  // from `state.tree`, because a shift-range means the rows you can actually
+  // see between two clicks — collapsed folders hide their children from it.
+  function visibleRowPaths() {
+    return Array.from(els.tree.querySelectorAll(".row[data-path]"))
+      .map((row) => row.getAttribute("data-path"));
+  }
+
+  function selectedPaths() {
+    // Always top-to-bottom, so a multi-item drop lands in the order the rows
+    // were shown in rather than whatever order the set happens to iterate.
+    return visibleRowPaths().filter((p) => state.selection.has(p));
+  }
+
+  function selectOnly(path) {
+    state.selection = new Set([path]);
+    state.selectionAnchor = path;
+    syncTreeSelection();
+  }
+
+  function toggleSelected(path) {
+    if (state.selection.has(path)) state.selection.delete(path);
+    else state.selection.add(path);
+    state.selectionAnchor = path;
+    syncTreeSelection();
+  }
+
+  function selectRangeTo(path) {
+    const rows = visibleRowPaths();
+    const anchor = rows.includes(state.selectionAnchor) ? state.selectionAnchor : path;
+    const from = rows.indexOf(anchor);
+    const to = rows.indexOf(path);
+    if (from < 0 || to < 0) return;
+    const lo = Math.min(from, to);
+    const hi = Math.max(from, to);
+    state.selection = new Set(rows.slice(lo, hi + 1));
+    syncTreeSelection();
+  }
+
+  function clearSelection() {
+    if (!state.selection.size && !state.selectionAnchor) return;
+    state.selection.clear();
+    state.selectionAnchor = null;
+    syncTreeSelection();
+  }
+
+  // A modifier click only changes the selection — it must not also open the
+  // note under the pointer, which is the whole point of holding the key.
+  function handledAsSelectionClick(path, e) {
+    if (e.metaKey || e.ctrlKey) {
+      toggleSelected(path);
+      return true;
+    }
+    if (e.shiftKey) {
+      selectRangeTo(path);
+      return true;
+    }
+    return false;
+  }
+
+  // Paths whose parent isn't also selected. Deleting a folder takes its
+  // children with it, so acting on both would fail on the second one.
+  function outermost(paths) {
+    return paths.filter((p) => !paths.some((q) => q !== p && p.startsWith(q + "/")));
+  }
+
+  // A move or a reload can leave the selection naming rows that are gone.
+  function pruneSelection() {
+    if (!state.selection.size) return;
+    const live = new Set();
+    const walk = (nodes) => (nodes || []).forEach((n) => {
+      live.add(n.path);
+      walk(n.children);
+    });
+    walk(state.tree);
+    state.selection.forEach((p) => { if (!live.has(p)) state.selection.delete(p); });
+    if (state.selectionAnchor && !live.has(state.selectionAnchor)) state.selectionAnchor = null;
+  }
+
   // Moves the highlight and nothing else. Opening a note or picking a folder
   // used to call `renderTree()`, which threw away and rebuilt every row —
   // and every row's four event listeners — to change one class.
   function syncTreeSelection() {
     els.tree.querySelectorAll(".row.selected").forEach((el) => el.classList.remove("selected"));
-    [state.path, state.selectedDir].forEach((p) => {
-      if (!p) return;
+    const marked = new Set(state.selection);
+    [state.path, state.selectedDir].forEach((p) => { if (p) marked.add(p); });
+    marked.forEach((p) => {
       const row = rowForPath(p);
       if (row) row.classList.add("selected");
     });
@@ -320,8 +406,10 @@
         chev.innerHTML = iconHTML(nowCollapsed ? "chevronRight" : "chevronDown");
         icon.innerHTML = iconHTML(nowCollapsed ? "folder" : "folderFill");
       });
-      row.addEventListener("click", () => {
+      row.addEventListener("click", (e) => {
         if (state.renamingPath === node.path) return;
+        if (handledAsSelectionClick(node.path, e)) return;
+        selectOnly(node.path);
         state.selectedDir = node.path;
         state.path = null;
         setDocumentTitle(node.title);
@@ -383,8 +471,10 @@
       row.appendChild(label);
     }
 
-    row.addEventListener("click", () => {
+    row.addEventListener("click", (e) => {
       if (state.renamingPath === path) return;
+      if (handledAsSelectionClick(path, e)) return;
+      selectOnly(path);
       openNote(path);
     });
     const fileItem = { path, title, isDirectory: false };
@@ -405,6 +495,34 @@
   // Right-click only. The touch long press used to live here too, but it has
   // to decide between opening the menu and picking the row up, so it moved
   // into `bindItemDrag` where that state is.
+  async function deleteSelected() {
+    // Only the outermost paths: deleting a folder takes its children with it,
+    // and the request for a child would then be deleting something gone.
+    const paths = outermost(selectedPaths());
+    if (!paths.length) return;
+    const covers = (p) => paths.some((q) => p === q || p.startsWith(q + "/"));
+    if (!confirm("Move " + paths.length + " item" + (paths.length === 1 ? "" : "s") + " to Trash?")) return;
+    if (pendingSave && covers(pendingSave.path)) dropPendingSave();
+    for (const path of paths) {
+      await api("/api/note?path=" + encodeURIComponent(path), { method: "DELETE" });
+    }
+    if (state.path && covers(state.path)) {
+      state.path = null;
+      setDocumentTitle(null);
+      els.noteTitle.textContent = "Select a note";
+      els.rawEditor.value = "";
+      els.cookedView.innerHTML = "";
+    }
+    if (state.selectedDir && covers(state.selectedDir)) state.selectedDir = null;
+    clearSelection();
+    await loadTree();
+  }
+
+  /// Whether a menu opened on `item` should act on the whole selection.
+  function actsOnSelection(item) {
+    return state.selection.size > 1 && state.selection.has(item.path);
+  }
+
   function bindItemMenu(row, item) {
     row.addEventListener("contextmenu", (e) => {
       e.preventDefault();
@@ -424,13 +542,19 @@
       b.addEventListener("click", () => { hideMenus(); fn(); });
       m.appendChild(b);
     };
-    if (item.isDirectory) {
-      add("Expand All", () => expandAllUnder(item.path));
-      add("Collapse All", () => collapseAllUnder(item.path));
-      if (item.manualOrder) add("Sort by Name", () => clearManualOrder(item.path));
+    if (actsOnSelection(item)) {
+      // Renaming several things at once means nothing, so the multi-selection
+      // menu offers only what applies to all of them.
+      add("Delete " + state.selection.size + " Items", () => deleteSelected(), true);
+    } else {
+      if (item.isDirectory) {
+        add("Expand All", () => expandAllUnder(item.path));
+        add("Collapse All", () => collapseAllUnder(item.path));
+        if (item.manualOrder) add("Sort by Name", () => clearManualOrder(item.path));
+      }
+      add("Rename", () => startRename(item.path, item.title));
+      add("Delete", () => deleteNote(item.path, item.isDirectory), true);
     }
-    add("Rename", () => startRename(item.path, item.title));
-    add("Delete", () => deleteNote(item.path, item.isDirectory), true);
     requestAnimationFrame(() => {
       const r = m.getBoundingClientRect();
       m.style.left = Math.min(x, window.innerWidth - r.width - 8) + "px";
@@ -449,13 +573,17 @@
       b.addEventListener("click", () => { hideMenus(); fn(); });
       els.sheetCard.appendChild(b);
     };
-    if (item.isDirectory) {
-      add("Expand All", () => expandAllUnder(item.path));
-      add("Collapse All", () => collapseAllUnder(item.path));
-      if (item.manualOrder) add("Sort by Name", () => clearManualOrder(item.path));
+    if (actsOnSelection(item)) {
+      add("Delete " + state.selection.size + " Items", () => deleteSelected(), true);
+    } else {
+      if (item.isDirectory) {
+        add("Expand All", () => expandAllUnder(item.path));
+        add("Collapse All", () => collapseAllUnder(item.path));
+        if (item.manualOrder) add("Sort by Name", () => clearManualOrder(item.path));
+      }
+      add("Rename", () => startRename(item.path, item.title));
+      add("Delete", () => deleteNote(item.path, item.isDirectory), true);
     }
-    add("Rename", () => startRename(item.path, item.title));
-    add("Delete", () => deleteNote(item.path, item.isDirectory), true);
     add("Cancel", () => {});
   }
 
@@ -1270,6 +1398,7 @@
 
   const drag = {
     item: null,
+    paths: [],
     row: null,
     pointerId: null,
     startX: 0,
@@ -1350,15 +1479,21 @@
   }
 
   function targetAllowed(target) {
-    if (!target || !drag.item) return false;
-    const src = drag.item.path;
-    // Nothing can be dropped inside itself.
-    if (drag.item.isDirectory
-        && (target.destination === src || target.destination.startsWith(src + "/"))) {
-      return false;
+    if (!target || !drag.paths.length) return false;
+    for (const src of drag.paths) {
+      // Nothing can be dropped inside itself, and a folder can't be dropped
+      // into its own subtree.
+      const entry = drag.index.get(src);
+      const isDirectory = entry ? entry.node.isDirectory : false;
+      if (isDirectory
+          && (target.destination === src || target.destination.startsWith(src + "/"))) {
+        return false;
+      }
+      // Landing in front of one of the rows being carried is meaningless.
+      if (target.before === src) return false;
     }
-    if (target.before === src) return false;
-    const entry = drag.index.get(src);
+    if (drag.paths.length > 1) return true;
+    const entry = drag.index.get(drag.paths[0]);
     if (!entry) return true;
     if (target.destination !== entry.parent) return true;
     // Same folder: refuse the positions it already occupies, so a stray drag
@@ -1447,6 +1582,12 @@
     drag.liftTimer = null;
     drag.active = true;
     drag.index = buildDragIndex();
+    // Dragging a row that is part of a multi-selection carries the whole
+    // selection; dragging anything else carries just that row, and leaves the
+    // selection alone rather than silently redefining it mid-gesture.
+    drag.paths = state.selection.has(drag.item.path) && state.selection.size > 1
+      ? selectedPaths()
+      : [drag.item.path];
     try { drag.row.setPointerCapture(drag.pointerId); } catch { /* gone */ }
     drag.row.classList.remove("lifted");
     drag.row.classList.add("drag-source");
@@ -1454,7 +1595,9 @@
 
     const ghost = document.createElement("div");
     ghost.className = "drag-ghost";
-    ghost.textContent = drag.item.title;
+    ghost.textContent = drag.paths.length > 1
+      ? drag.paths.length + " items"
+      : drag.item.title;
     document.body.appendChild(ghost);
     drag.ghost = ghost;
 
@@ -1558,15 +1701,15 @@
   }
 
   function commitDrag() {
-    const item = drag.item;
+    const paths = drag.paths.slice();
     const target = drag.target;
     endDrag();
     // Suppresses the click the pointer sequence is about to synthesise, which
     // would otherwise open whichever note the drag happened to end on. Armed
     // even for a drop that goes nowhere, since that click is still coming.
     swallowNextClick();
-    if (!item || !target) return;
-    moveItem(item, target).catch((err) => {
+    if (!paths.length || !target) return;
+    moveItems(paths, target).catch((err) => {
       console.error(err);
       toast(err.message || "Move failed");
     });
@@ -1585,6 +1728,7 @@
     }
     document.body.classList.remove("dragging-row");
     drag.item = null;
+    drag.paths = [];
     drag.row = null;
     drag.pointerId = null;
     drag.lifted = false;
@@ -1613,14 +1757,14 @@
     setTimeout(() => document.removeEventListener("click", eat, { capture: true }), 350);
   }
 
-  async function moveItem(item, target) {
+  async function moveItems(paths, target) {
     // A queued autosave still names the old path; firing it after the move
     // would write the note straight back where it came from.
     await flushSave();
     const res = await api("/api/tree/move", {
       method: "POST",
       body: JSON.stringify({
-        paths: [item.path],
+        paths,
         destination: target.destination,
         before: target.before,
       }),
@@ -1637,6 +1781,8 @@
     if (state.selectedDir) state.selectedDir = at(state.selectedDir);
     if (state.renamingPath) state.renamingPath = at(state.renamingPath);
     if (state.collapsed.size) state.collapsed = new Set([...state.collapsed].map(at));
+    if (state.selection.size) state.selection = new Set([...state.selection].map(at));
+    if (state.selectionAnchor) state.selectionAnchor = at(state.selectionAnchor);
   }
 
   async function clearManualOrder(path) {
@@ -1878,6 +2024,10 @@
   bindExternalDrop();
   // Non-passive, so a drag in progress can actually refuse the scroll. The
   // tree's `touch-action: pan-y` can't be changed once a gesture has started.
+  els.tree.addEventListener("click", (e) => {
+    const onRow = e.target && e.target.closest && e.target.closest(".row[data-path]");
+    if (!onRow) clearSelection();
+  });
   els.tree.addEventListener("touchmove", (e) => {
     if (drag.active) e.preventDefault();
   }, { passive: false });
