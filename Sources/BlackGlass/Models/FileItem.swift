@@ -9,9 +9,13 @@ public struct FileItem: Identifiable, Hashable, Sendable {
     public var modifiedAt: Date?
 
     public init(url: URL, isDirectory: Bool, children: [FileItem]? = nil, modifiedAt: Date? = nil) {
-        self.id = url.standardizedFileURL.path
+        // Standardized once, not twice: this runs for every file in the vault
+        // on each tree load, and collapsing `/private` can hit the filesystem.
+        // `name` stays on the original URL so it keeps its exact old meaning.
+        let standardized = url.standardizedFileURL
+        self.id = standardized.path
         self.name = url.lastPathComponent
-        self.url = url.standardizedFileURL
+        self.url = standardized
         self.isDirectory = isDirectory
         self.children = children
         self.modifiedAt = modifiedAt

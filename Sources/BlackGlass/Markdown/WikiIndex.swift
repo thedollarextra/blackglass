@@ -174,9 +174,11 @@ final class WikiIndex: @unchecked Sendable {
 
     func notesWithTag(_ tag: String) -> [NoteRecord] {
         let needle = tag.hasPrefix("#") ? String(tag.dropFirst()) : tag
+        // Was rebuilt once per tag per note; it is the same string every time.
+        let nestedPrefix = needle.lowercased() + "/"
         lock.lock(); defer { lock.unlock() }
         return notes.values.filter { rec in
-            rec.tags.contains { $0.caseInsensitiveCompare(needle) == .orderedSame || $0.lowercased().hasPrefix(needle.lowercased() + "/") }
+            rec.tags.contains { $0.caseInsensitiveCompare(needle) == .orderedSame || $0.lowercased().hasPrefix(nestedPrefix) }
         }
     }
 

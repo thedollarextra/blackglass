@@ -297,6 +297,10 @@ enum VaultWalk {
                 }
             }
         }
+        // Trim the builder here, where the walk is still its only owner. Left
+        // to `install`, the trim mutated a copy while this one was alive, so
+        // every unshrunk posting list stayed resident next to its replacement.
+        out.builder.shrink()
         out.bytes = bytes
         out.records = records.compactMap { $0 }
         return out

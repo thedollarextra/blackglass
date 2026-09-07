@@ -26,7 +26,7 @@ enum OFMHTML {
             depth: depth,
             seen: seen.union([current.standardizedFileURL.path])
         )
-        var body = doc.blocks.map { renderBlock($0, ctx: &ctx) }.joined()
+        var body = renderBlocks(doc.blocks, ctx: &ctx)
         if !doc.footnotes.isEmpty {
             body += "<section class=\"footnotes\"><hr/><ol>"
             for (key, ins) in doc.footnotes.sorted(by: { $0.key < $1.key }) {
@@ -78,6 +78,23 @@ enum OFMHTML {
         var web: Bool
         var depth: Int
         var seen: Set<String>
+        /// Notes link to the same handful of targets over and over, and each
+        /// miss in `WikiIndex.resolveNote` costs up to eight `stat` calls.
+        /// Reset for an embed, whose resolution is relative to its own folder.
+        var noteCache: [String: URL?] = [:]
+    }
+
+    private static func resolvedNote(_ target: String, ctx: inout Context) -> URL? {
+        if let hit = ctx.noteCache[target] { return hit }
+        let url = ctx.wiki.resolveNote(target: target, from: ctx.current, vault: ctx.vault)
+        ctx.noteCache.updateValue(url, forKey: target)
+        return url
+    }
+
+    private static func renderBlocks(_ blocks: [OFMBlock], ctx: inout Context) -> String {
+        var out = ""
+        for b in blocks { out += renderBlock(b, ctx: &ctx) }
+        return out
     }
 
     private static func renderBlock(_ block: OFMBlock, ctx: inout Context) -> String {
@@ -91,25 +108,23 @@ enum OFMHTML {
             return "<p\(bid)>\(renderInlines(text, ctx: &ctx))</p>\n"
         case .list(let ordered, let items):
             let tag = ordered ? "ol" : "ul"
-            let inner = items.map { item -> String in
-                var cls = ""
-                var attr = ""
+            var inner = ""
+            for item in items {
                 if let task = item.task {
-                    cls = " class=\"task\""
-                    attr = " data-task=\"\(task)\""
                     let checked = task == "x" || task == "X"
                     let box = "<input type=\"checkbox\" disabled \(checked ? "checked" : "")/> "
-                    let body = item.blocks.map { renderBlock($0, ctx: &ctx) }.joined()
-                    return "<li\(cls)\(attr)>\(box)\(body)</li>"
+                    let body = renderBlocks(item.blocks, ctx: &ctx)
+                    inner += "<li class=\"task\" data-task=\"\(task)\">\(box)\(body)</li>"
+                    continue
                 }
                 let bid = item.blockId.map { " id=\"^\($0)\"" } ?? ""
-                return "<li\(bid)>\(item.blocks.map { renderBlock($0, ctx: &ctx) }.joined())</li>"
-            }.joined()
+                inner += "<li\(bid)>\(renderBlocks(item.blocks, ctx: &ctx))</li>"
+            }
             return "<\(tag)>\(inner)</\(tag)>\n"
         case .blockquote(let children):
-            return "<blockquote>\(children.map { renderBlock($0, ctx: &ctx) }.joined())</blockquote>\n"
+            return "<blockquote>\(renderBlocks(children, ctx: &ctx))</blockquote>\n"
         case .callout(let type, let title, let fold, let children):
-            let inner = children.map { renderBlock($0, ctx: &ctx) }.joined()
+            let inner = renderBlocks(children, ctx: &ctx)
             let icon = calloutIcon(type)
             let head = "<div class=\"callout-title\"><span class=\"callout-icon\">\(icon)</span><span>\(escape(title))</span></div>"
             if fold == "+" {
@@ -151,7 +166,10 @@ enum OFMHTML {
     }
 
     private static func renderInlines(_ ins: [OFMInline], ctx: inout Context) -> String {
-        ins.map { renderInline($0, ctx: &ctx) }.joined()
+        if ins.count == 1 { return renderInline(ins[0], ctx: &ctx) }
+        var out = ""
+        for n in ins { out += renderInline(n, ctx: &ctx) }
+        return out
     }
 
     private static func renderInline(_ n: OFMInline, ctx: inout Context) -> String {
@@ -190,8 +208,13 @@ enum OFMHTML {
         if t.dest.isEmpty, t.headings.isEmpty, t.blockId == nil {
             return "<span class=\"wikilink unresolved\">\(escape(t.display))</span>"
         }
-        if let url = ctx.wiki.resolveNote(target: t.dest.isEmpty ? ctx.current.deletingPathExtension().lastPathComponent : t.dest, from: ctx.current, vault: ctx.vault)
-            ?? (t.dest.isEmpty ? ctx.current : ctx.wiki.resolveNote(target: t.dest, from: ctx.current, vault: ctx.vault)) {
+        // The old `??` fallback re-ran the identical lookup whenever a link with
+        // a non-empty destination failed to resolve, doubling the `stat` storm
+        // for exactly the links that are already the expensive ones.
+        let target = t.dest.isEmpty ? ctx.current.deletingPathExtension().lastPathComponent : t.dest
+        var resolved = resolvedNote(target, ctx: &ctx)
+        if resolved == nil, t.dest.isEmpty { resolved = ctx.current }
+        if let url = resolved {
             let rel = ctx.wiki.relative(url, vault: ctx.vault)
             var href = wikiHref(rel, web: ctx.web)
             if let bid = t.blockId { href += "#^\(bid)" }
@@ -230,7 +253,7 @@ enum OFMHTML {
         guard ctx.depth < 4 else { return "<div class=\"embed\">Too many nested embeds.</div>" }
         let destURL: URL? = t.dest.isEmpty
             ? ctx.current
-            : ctx.wiki.resolveNote(target: t.dest, from: ctx.current, vault: ctx.vault)
+            : resolvedNote(t.dest, ctx: &ctx)
         guard let destURL else {
             return "<div class=\"embed unresolved\">Missing: \(escape(t.display))</div>"
         }
@@ -250,7 +273,8 @@ enum OFMHTML {
         child.current = destURL
         child.depth += 1
         child.seen.insert(key)
-        let inner = slice.map { renderBlock($0, ctx: &child) }.joined()
+        child.noteCache.removeAll()
+        let inner = renderBlocks(slice, ctx: &child)
         let title = FileItem(url: destURL, isDirectory: false).displayTitle
         return "<div class=\"embed\"><div class=\"embed-title\">\(escape(title))</div>\(inner)</div>"
     }
@@ -370,22 +394,61 @@ enum OFMHTML {
         return url.absoluteString
     }
 
+    /// The old chain built a whole replacement string, then a filtered scalar
+    /// array, then a `String` per surviving scalar, then joined them — four
+    /// passes and one allocation per character of every heading and every
+    /// heading-bearing wikilink.
     private static func slugify(_ s: String) -> String {
-        s.lowercased()
-            .replacingOccurrences(of: " ", with: "-")
-            .unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) || $0 == "-" }
-            .map(String.init)
-            .joined()
+        let allowed = CharacterSet.alphanumerics
+        var out = String.UnicodeScalarView()
+        for c in s.lowercased() {
+            // Walking graphemes, not scalars: `replacingOccurrences` matched
+            // whole characters, so a space carrying a combining mark was never
+            // a space to it and fell through to the scalar filter instead.
+            if c == " " {
+                out.append("-")
+                continue
+            }
+            for u in c.unicodeScalars where allowed.contains(u) || u == "-" {
+                out.append(u)
+            }
+        }
+        return String(out)
     }
 
+    /// Chained `replacingOccurrences` walked the string three times (four for
+    /// an attribute) and allocated a fresh `String` per pass, for every text
+    /// node in the note. Escaping is pure ASCII, so one UTF-8 pass does it —
+    /// and the overwhelmingly common case, nothing to escape, allocates nothing.
     private static func escape(_ s: String) -> String {
-        s.replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
+        guard s.utf8.contains(where: { $0 == 0x26 || $0 == 0x3C || $0 == 0x3E }) else { return s }
+        var out: [UInt8] = []
+        out.reserveCapacity(s.utf8.count + 16)
+        for b in s.utf8 {
+            switch b {
+            case 0x26: out.append(contentsOf: "&amp;".utf8)
+            case 0x3C: out.append(contentsOf: "&lt;".utf8)
+            case 0x3E: out.append(contentsOf: "&gt;".utf8)
+            default: out.append(b)
+            }
+        }
+        return String(decoding: out, as: UTF8.self)
     }
 
     private static func escapeAttr(_ s: String) -> String {
-        escape(s).replacingOccurrences(of: "\"", with: "&quot;")
+        guard s.utf8.contains(where: { $0 == 0x26 || $0 == 0x3C || $0 == 0x3E || $0 == 0x22 }) else { return s }
+        var out: [UInt8] = []
+        out.reserveCapacity(s.utf8.count + 16)
+        for b in s.utf8 {
+            switch b {
+            case 0x26: out.append(contentsOf: "&amp;".utf8)
+            case 0x3C: out.append(contentsOf: "&lt;".utf8)
+            case 0x3E: out.append(contentsOf: "&gt;".utf8)
+            case 0x22: out.append(contentsOf: "&quot;".utf8)
+            default: out.append(b)
+            }
+        }
+        return String(decoding: out, as: UTF8.self)
     }
 
     private static func calloutIcon(_ type: String) -> String {

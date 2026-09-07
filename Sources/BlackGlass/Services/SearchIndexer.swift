@@ -57,13 +57,15 @@ public struct IndexedDocument: Sendable {
 /// preview covers the common case and the handful of results actually shown get
 /// their snippet read back from disk.
 public final class SearchIndex: @unchecked Sendable {
+    /// No lowercased preview is kept: it is a second 160-character heap string
+    /// per note, and only the handful of documents inside the ranking window
+    /// are ever tested against it.
     fileprivate struct Doc: Sendable {
         var path: String
         var title: String
         var titleLower: String
         var preview: String
-        var previewLower: String
-        var tokens: [Int32]     // sorted token ids, for eviction and scoring
+        var tokens: [Int32]     // sorted token ids, for eviction
     }
 
     /// How many results get a snippet read from disk; the rest use the preview.
@@ -80,6 +82,12 @@ public final class SearchIndex: @unchecked Sendable {
     /// Token ids ordered by their text, so prefix queries binary-search a range.
     private var sortedTokens: [Int32] = []
     private var sortedTokensDirty = false
+    /// Each document slot's position in the localized title ordering, so the
+    /// ranking tie-break is an integer compare. `localizedStandardCompare` runs
+    /// about a microsecond, and a one- or two-letter prefix — the first thing
+    /// every type-ahead query sends — puts most of the vault through it.
+    private var titleRank: [Int32] = []
+    private var titleRankDirty = false
 
     public init() {}
 
@@ -121,6 +129,8 @@ public final class SearchIndex: @unchecked Sendable {
         postings.removeAll(keepingCapacity: false)
         sortedTokens.removeAll(keepingCapacity: false)
         sortedTokensDirty = false
+        titleRank.removeAll(keepingCapacity: false)
+        titleRankDirty = false
         lock.unlock()
     }
 
@@ -166,7 +176,6 @@ public final class SearchIndex: @unchecked Sendable {
                 title: input.title,
                 titleLower: input.title.lowercased(),
                 preview: input.preview,
-                previewLower: input.preview.lowercased(),
                 tokens: ids
             ))
             byPath[path] = id
@@ -175,20 +184,38 @@ public final class SearchIndex: @unchecked Sendable {
         /// Appended posting lists carry up to 2x the capacity they need.
         /// Copying them to exact size before install gives back ~2 MB on a
         /// 2,000-note vault.
-        fileprivate mutating func shrink() {
+        ///
+        /// Must run while the builder is still uniquely referenced — the walk
+        /// owns it. Doing it inside `install` instead mutated a second copy, so
+        /// every original posting list stayed alive beside its replacement and
+        /// the whole table was briefly resident twice.
+        mutating func shrink() {
             for i in postings.indices where postings[i].capacity > postings[i].count {
                 var exact = [Int32]()
                 exact.reserveCapacity(postings[i].count)
                 exact.append(contentsOf: postings[i])
                 postings[i] = exact
             }
+            // Both tables doubled their way to size as well, and that slack —
+            // 16 bytes per unused token slot — outlives the build.
+            if tokenText.capacity > tokenText.count {
+                var exact = [String]()
+                exact.reserveCapacity(tokenText.count)
+                exact.append(contentsOf: tokenText)
+                tokenText = exact
+            }
+            if postings.capacity > postings.count {
+                var exact = [[Int32]]()
+                exact.reserveCapacity(postings.count)
+                exact.append(contentsOf: postings)
+                postings = exact
+            }
         }
     }
 
-    /// Atomically replace the whole index with a finished build.
+    /// Atomically replace the whole index with a finished build. The builder
+    /// arrives already shrunk; see `Builder.shrink`.
     public func install(_ builder: Builder) {
-        var builder = builder
-        builder.shrink()
         lock.lock()
         docs = builder.docs
         docIDByPath = builder.byPath
@@ -197,6 +224,7 @@ public final class SearchIndex: @unchecked Sendable {
         tokenText = builder.tokenText
         postings = builder.postings
         sortedTokensDirty = true
+        titleRankDirty = true
         lock.unlock()
     }
 
@@ -249,10 +277,10 @@ public final class SearchIndex: @unchecked Sendable {
             title: input.title,
             titleLower: input.title.lowercased(),
             preview: input.preview,
-            previewLower: input.preview.lowercased(),
             tokens: ids
         )
         docIDByPath[path] = id
+        titleRankDirty = true
     }
 
     private func removeLocked(path: String) {
@@ -267,6 +295,7 @@ public final class SearchIndex: @unchecked Sendable {
         }
         docs[Int(id)] = nil
         freeSlots.append(id)
+        titleRankDirty = true
     }
 
     // MARK: Query
@@ -279,6 +308,7 @@ public final class SearchIndex: @unchecked Sendable {
 
         lock.lock()
         if sortedTokensDirty { rebuildSortedTokensLocked() }
+        if titleRankDirty { rebuildTitleRankLocked() }
 
         var candidates: [Int32]?
         for (i, term) in terms.enumerated() {
@@ -312,20 +342,16 @@ public final class SearchIndex: @unchecked Sendable {
         }
         scored.sort { lhs, rhs in
             if lhs.0 != rhs.0 { return lhs.0 > rhs.0 }
-            let a = docs[Int(lhs.1)]?.title ?? ""
-            let b = docs[Int(rhs.1)]?.title ?? ""
-            return a.localizedStandardCompare(b) == .orderedAscending
+            return titleRank[Int(lhs.1)] < titleRank[Int(rhs.1)]
         }
         let previewWindow = min(scored.count, limit * 2)
         for i in 0..<previewWindow {
             guard let doc = docs[Int(scored[i].1)] else { continue }
-            if Self.contains(doc.previewLower, needleBytes) { scored[i].0 += 10 }
+            if Self.contains(doc.preview.lowercased(), needleBytes) { scored[i].0 += 10 }
         }
         scored[0..<previewWindow].sort { lhs, rhs in
             if lhs.0 != rhs.0 { return lhs.0 > rhs.0 }
-            let a = docs[Int(lhs.1)]?.title ?? ""
-            let b = docs[Int(rhs.1)]?.title ?? ""
-            return a.localizedStandardCompare(b) == .orderedAscending
+            return titleRank[Int(lhs.1)] < titleRank[Int(rhs.1)]
         }
         if scored.count > limit { scored.removeSubrange(limit...) }
         let picked = scored.compactMap { docs[Int($0.1)] }
@@ -370,6 +396,12 @@ public final class SearchIndex: @unchecked Sendable {
 
     private func substringPostingsLocked(_ needle: String) -> [Int32] {
         guard needle.count >= 2 else { return [] }
+        // Tokens are runs of letters and digits, so a needle carrying anything
+        // else - the space in a two-word query, a hyphen - cannot sit inside
+        // one and the scan can only come back empty. Checking first is what
+        // keeps a multi-word query that has not matched yet from walking the
+        // whole token table on every keystroke.
+        guard needle.allSatisfy({ $0.isLetter || $0.isNumber }) else { return [] }
         let bytes = Array(needle.utf8)
         var mask = [UInt64](repeating: 0, count: (docs.count + 63) / 64)
         var matched = false
@@ -421,6 +453,24 @@ public final class SearchIndex: @unchecked Sendable {
         sortedTokensDirty = false
     }
 
+    /// Places every live document in the localized title ordering once, so
+    /// queries tie-break on an `Int32` instead of paying for a locale-aware
+    /// comparison per candidate per keystroke. Only the index changing — a
+    /// rebuild or an edit — costs the ordering again.
+    private func rebuildTitleRankLocked() {
+        var live: [Int32] = []
+        live.reserveCapacity(docIDByPath.count)
+        for i in docs.indices where docs[i] != nil { live.append(Int32(i)) }
+        live.sort { lhs, rhs in
+            let a = docs[Int(lhs)]?.title ?? ""
+            let b = docs[Int(rhs)]?.title ?? ""
+            return a.localizedStandardCompare(b) == .orderedAscending
+        }
+        titleRank = [Int32](repeating: 0, count: docs.count)
+        for (rank, id) in live.enumerated() { titleRank[Int(id)] = Int32(rank) }
+        titleRankDirty = false
+    }
+
     private func lowerBoundToken(_ prefix: String) -> Int {
         var lo = 0, hi = sortedTokens.count
         while lo < hi {
@@ -455,20 +505,36 @@ public final class SearchIndex: @unchecked Sendable {
 
     // MARK: Text helpers
 
+    /// Deliberately not routed through `FileItem`: building one standardizes
+    /// the URL twice — each a filesystem round trip — and allocates the whole
+    /// path as an id, all thrown away, once per note in a rebuild.
     public static func displayTitle(for url: URL) -> String {
-        FileItem(url: url, isDirectory: false).displayTitle
+        let ext = url.pathExtension.lowercased()
+        if ext == "md" || ext == "markdown" || ext == "txt" {
+            return url.deletingPathExtension().lastPathComponent
+        }
+        return url.lastPathComponent
     }
 
     static func preview(of content: String) -> String {
         var out = ""
         out.reserveCapacity(170)
+        // Counted alongside, because `String.count` walks graphemes from the
+        // start: asking for it once per character made building a 160-character
+        // preview quadratic in its own length, on every note in the vault.
+        var length = 0
         var lastWasSpace = false
         for ch in content {
-            if out.count >= 160 { break }
+            if length >= 160 { break }
             if ch == "\n" || ch == "\r" || ch == "\t" {
-                if !lastWasSpace && !out.isEmpty { out.append(" "); lastWasSpace = true }
+                if !lastWasSpace && !out.isEmpty {
+                    out.append(" ")
+                    length += 1
+                    lastWasSpace = true
+                }
             } else {
                 out.append(ch)
+                length += 1
                 lastWasSpace = ch == " "
             }
         }

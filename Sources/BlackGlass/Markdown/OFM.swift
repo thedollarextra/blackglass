@@ -419,9 +419,6 @@ enum OFMParser {
                 blocks.append(parseMathBlock(lines, i: &i))
                 continue
             }
-            if isThematicBreak(trimmed), i + 1 >= lines.count || !isSetextUnderline(lines[i]) {
-                // could still be setext if previous was paragraph — handled below
-            }
             if let heading = atxHeading(trimmed) {
                 i += 1
                 let stripped = stripBlockID(heading.1)
@@ -440,6 +437,9 @@ enum OFMParser {
                 blocks.append(parseQuoteOrCallout(lines, i: &i, footnotes: &footnotes))
                 continue
             }
+            // A `---` under a one-line paragraph is a setext underline, not a
+            // break; the paragraph loop below claims that case before control
+            // ever gets back here.
             if isThematicBreak(trimmed) {
                 i += 1
                 blocks.append(.thematicBreak)
@@ -542,12 +542,21 @@ enum OFMParser {
             ordered = true
             after = String(restLine[restLine.index(after: afterDot)...])
         }
+        // `after.count` and `Array(after)` both walked the whole rest of the
+        // line, for every list item that starts with `[` — which in a vault
+        // full of `- [[Note]]` bullets is most of them.
         var task: Character?
-        if after.hasPrefix("[") , after.count >= 3 {
-            let chars = Array(after)
-            if chars.count >= 4, chars[2] == "]", chars[3] == " " {
-                task = chars[1]
-                after = String(chars.dropFirst(4))
+        if after.hasPrefix("[") {
+            var tail = after.dropFirst()
+            if let marker = tail.first {
+                tail = tail.dropFirst()
+                if tail.first == "]" {
+                    tail = tail.dropFirst()
+                    if tail.first == " " {
+                        task = marker
+                        after = String(tail.dropFirst())
+                    }
+                }
             }
         }
         return (indent, ordered, after, task)
@@ -560,6 +569,8 @@ enum OFMParser {
         }
         let ordered = first.ordered
         let baseIndent = first.indent
+        // Built once, not once per continuation line of every item.
+        let indentStr = String(repeating: " ", count: baseIndent + 2)
         var items: [OFMListItem] = []
         while i < lines.count, let mark = listMarker(lines[i]), mark.ordered == ordered, mark.indent == baseIndent {
             i += 1
@@ -568,7 +579,7 @@ enum OFMParser {
                 let l = lines[i]
                 if l.trimmingCharacters(in: .whitespaces).isEmpty {
                     if i + 1 < lines.count, listMarker(lines[i + 1]) != nil { break }
-                    if i + 1 < lines.count, lines[i + 1].hasPrefix(String(repeating: " ", count: baseIndent + 2)) {
+                    if i + 1 < lines.count, lines[i + 1].hasPrefix(indentStr) {
                         i += 1
                         continue
                     }
@@ -578,7 +589,6 @@ enum OFMParser {
                     if m.indent == baseIndent { break }
                     if m.indent > baseIndent { break }
                 }
-                let indentStr = String(repeating: " ", count: baseIndent + 2)
                 if l.hasPrefix(indentStr) {
                     chunk.append(String(l.dropFirst(min(l.count, baseIndent + 2))))
                     i += 1
@@ -608,17 +618,17 @@ enum OFMParser {
     private static func parseQuoteOrCallout(_ lines: [String], i: inout Int, footnotes: inout [String: [OFMInline]]) -> OFMBlock {
         var inner: [String] = []
         while i < lines.count {
-            let t = lines[i]
-            if t.hasPrefix(">") {
-                var s = String(t.dropFirst())
-                if s.hasPrefix(" ") { s = String(s.dropFirst()) }
-                inner.append(s)
-                i += 1
-            } else if t.trimmingCharacters(in: .whitespaces).isEmpty {
-                break
-            } else {
-                break
-            }
+            // Test exactly what `parseBlocks` tested to dispatch here — the
+            // trimmed line. Matching the raw line instead meant a `>` behind
+            // any leading whitespace consumed nothing and returned an empty
+            // blockquote without advancing `i`, so the caller spun on that
+            // line forever. Everything before the first `>` is whitespace the
+            // trim already removed, so this is a no-op for an unindented quote.
+            guard lines[i].trimmingCharacters(in: .whitespaces).hasPrefix(">") else { break }
+            var s = String(lines[i].drop(while: { $0 != ">" }).dropFirst())
+            if s.hasPrefix(" ") { s = String(s.dropFirst()) }
+            inner.append(s)
+            i += 1
         }
         if let first = inner.first,
            let m = calloutRx?.firstMatch(in: first, range: NSRange(location: 0, length: (first as NSString).length)),
@@ -631,7 +641,7 @@ enum OFMParser {
             }
             var title = ns.substring(with: m.range(at: 3)).trimmingCharacters(in: .whitespaces)
             if title.isEmpty { title = OFMCallout.defaultTitle(type) }
-            var rest = Array(inner.dropFirst())
+            let rest = Array(inner.dropFirst())
             var j = 0
             let children = parseBlocks(rest, i: &j, footnotes: &footnotes)
             return .callout(type: OFMCallout.canonical(type), title: title, fold: fold, children: children)
@@ -670,7 +680,7 @@ enum OFMParser {
     }
 
     private static func parseMathBlock(_ lines: [String], i: inout Int) -> OFMBlock {
-        var line = lines[i].trimmingCharacters(in: .whitespaces)
+        let line = lines[i].trimmingCharacters(in: .whitespaces)
         i += 1
         if line.hasPrefix("$$"), line.hasSuffix("$$"), line.count > 4 {
             let inner = String(line.dropFirst(2).dropLast(2))
@@ -749,15 +759,47 @@ enum OFMParser {
     }
 
     private static func footnoteDef(_ t: String) -> (String, String)? {
-        guard t.hasPrefix("[^"), let close = t.firstIndex(of: "]"),
-              close < t.endIndex, t[t.index(after: close)] == ":" else { return nil }
+        // `close < t.endIndex` is true for any index `firstIndex(of:)` returns,
+        // so it never guarded anything: a line that is just `[^1]` ran the
+        // subscript one past the end and trapped. The colon is what has to
+        // exist, not the bracket.
+        guard t.hasPrefix("[^"), let close = t.firstIndex(of: "]") else { return nil }
+        let afterClose = t.index(after: close)
+        guard afterClose < t.endIndex, t[afterClose] == ":" else { return nil }
         let id = String(t[t.index(t.startIndex, offsetBy: 2)..<close])
-        let text = String(t[t.index(after: t.index(after: close))...]).trimmingCharacters(in: .whitespaces)
+        let text = String(t[t.index(after: afterClose)...]).trimmingCharacters(in: .whitespaces)
         return (id, text)
     }
 
+    /// `blockIDRx` is anchored at the end of the string, so a paragraph whose
+    /// trailing word isn't `^id` preceded by whitespace can never match it.
+    /// Deciding that by hand keeps the NSString bridge and an ICU run off the
+    /// per-paragraph, per-heading path, where they were only ever failing.
+    /// Deliberately permissive: it may say yes where the regex says no, but it
+    /// only says no where the regex could not have matched.
+    private static func mightEndWithBlockID(_ text: String) -> Bool {
+        var i = text.endIndex
+        while i > text.startIndex {                       // `\s*$`
+            let j = text.index(before: i)
+            guard text[j].isWhitespace else { break }
+            i = j
+        }
+        var run = 0
+        while i > text.startIndex {                       // `[A-Za-z0-9-]+`
+            let j = text.index(before: i)
+            let c = text[j]
+            guard c == "-" || (c.isASCII && (c.isLetter || c.isNumber)) else { break }
+            i = j
+            run += 1
+        }
+        guard run > 0, i > text.startIndex else { return false }
+        let caret = text.index(before: i)                  // `\^`
+        guard text[caret] == "^", caret > text.startIndex else { return false }
+        return text[text.index(before: caret)].isWhitespace // `\s`
+    }
+
     private static func stripBlockID(_ text: String) -> (text: String, id: String?) {
-        guard let rx = blockIDRx else { return (text, nil) }
+        guard mightEndWithBlockID(text), let rx = blockIDRx else { return (text, nil) }
         let ns = text as NSString
         let range = NSRange(location: 0, length: ns.length)
         guard let m = rx.firstMatch(in: text, range: range), m.numberOfRanges > 1 else {
@@ -779,13 +821,12 @@ enum OFMParser {
             if !buf.isEmpty { out.append(.text(buf)); buf.removeAll(keepingCapacity: true) }
         }
         let n = chars.count
-        let punct = CharacterSet(charactersIn: "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 
         while i < n {
             let c = chars[i]
             if c == "\\" , i + 1 < n {
                 let next = chars[i + 1]
-                if String(next).unicodeScalars.allSatisfy({ punct.contains($0) }) {
+                if isEscapablePunctuation(next) {
                     buf.append(next)
                     i += 2
                     continue
@@ -942,6 +983,15 @@ enum OFMParser {
         return out
     }
 
+    /// The escapable set is exactly ASCII punctuation, so the old
+    /// `CharacterSet(charactersIn:)` — rebuilt on entry to *every* call of
+    /// `parseInlines`, and it recurses once per emphasis span — bought nothing.
+    private static func isEscapablePunctuation(_ c: Character) -> Bool {
+        guard let v = c.asciiValue else { return false }
+        return (v >= 0x21 && v <= 0x2F) || (v >= 0x3A && v <= 0x40)
+            || (v >= 0x5B && v <= 0x60) || (v >= 0x7B && v <= 0x7E)
+    }
+
     private static func isTagStart(_ c: Character) -> Bool { c.isLetter || c == "_" }
     private static func isTagChar(_ c: Character) -> Bool {
         c.isLetter || c.isNumber || c == "_" || c == "-" || c == "/"
@@ -967,8 +1017,11 @@ enum OFMParser {
         while i + n < chars.count, chars[i + n] == delim { n += 1 }
         i += n
         let start = i
+        // Hoisted: the closing run is fixed, but building it inside the scan
+        // meant one array allocation per character of every inline code span.
+        let closing = Array(repeating: delim, count: n)
         while i + n <= chars.count {
-            if matches(chars, at: i, Array(repeating: delim, count: n)) {
+            if matches(chars, at: i, closing) {
                 let inner = String(chars[start..<i])
                 i += n
                 return inner
