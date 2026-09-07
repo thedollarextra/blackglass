@@ -8,6 +8,10 @@ struct APINode: Codable {
     var title: String
     var path: String
     var isDirectory: Bool
+    /// Set only on folders the user has dragged into a manual order, so the
+    /// web client can offer to put one back in name order without having to
+    /// ask about every folder it draws. Omitted from the JSON otherwise.
+    var manualOrder: Bool?
     var children: [APINode]?
 }
 
@@ -128,15 +132,18 @@ final class NoteServer: ObservableObject {
         if request.method == "OPTIONS" {
             return HTTPResponse(status: 204, contentType: "text/plain; charset=utf-8", body: Data())
         }
+        // `HTTPRequestHead.parse` already split the query string off, so
+        // `path` is the bare route — the three `split(separator: "?")` calls
+        // this and the handlers below made per request were re-splitting a
+        // string that can no longer contain a `?`.
         let path = request.path
-        let route = path.split(separator: "?").first.map(String.init) ?? path
-        if route == "/api/appearance" {
+        if path == "/api/appearance" {
             return handleAppearance(request)
         }
         if path.hasPrefix("/api/") {
             return handleAPI(request)
         }
-        return serveStatic(path: path)
+        return serveStatic(request)
     }
 
     private func handleAppearance(_ request: HTTPRequest) -> HTTPResponse {
@@ -157,9 +164,14 @@ final class NoteServer: ObservableObject {
             return .json(["error": "No active vault"], status: 400)
         }
         let vaultURL = vault.url
-        let route = request.path.split(separator: "?").first.map(String.init) ?? request.path
+        let route = request.path
 
-        let jsonBody = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any]
+        // Only the mutating routes carry a body. Parsing unconditionally made
+        // every GET — the tree, each note open, every keystroke of search —
+        // pay for a throwing `JSONSerialization` call on empty data.
+        let jsonBody: [String: Any]? = request.body.isEmpty
+            ? nil
+            : (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any]
 
         switch (request.method, route) {
         case ("GET", "/api/vault"):
@@ -187,7 +199,7 @@ final class NoteServer: ObservableObject {
 
         case ("GET", "/api/tree"):
             vaultManager.refreshFileTree()
-            let nodes = vaultManager.fileTree.map { Self.encode($0, vault: vaultURL) }
+            let nodes = vaultManager.fileTree.map { Self.encode($0, vault: vaultURL, manager: vaultManager) }
             return .json(nodes)
 
         case ("GET", "/api/note"):
@@ -260,6 +272,82 @@ final class NoteServer: ObservableObject {
             let ids = item.folderIDsInSubtree.map { Self.relative(URL(fileURLWithPath: $0), vault: vaultURL) }
             return .json(["ok": true, "paths": ids])
 
+        case ("POST", "/api/tree/move"):
+            // The tree's drag and drop, in one route. `reorderItems` covers
+            // both halves of it: a drop onto a different folder moves on
+            // disk, a drop between two rows of the folder something already
+            // lives in is a pure reorder, and a drop that does both does
+            // both. `before` is the sibling the items land in front of, or
+            // absent to park them at the end.
+            guard let rels = jsonBody?["paths"] as? [String], !rels.isEmpty else {
+                return .json(["error": "Missing paths"], status: 400)
+            }
+            guard let destination = Self.resolve(jsonBody?["destination"] as? String ?? "", vault: vaultURL),
+                  Self.isDirectory(destination) else {
+                return .json(["error": "Destination is not a folder"], status: 400)
+            }
+            // Straight off the tree where possible: a folder's `FileItem`
+            // built here would carry no children, and `moveItems` needs the
+            // subtree to remap the paths of everything inside it.
+            let items = rels.compactMap { rel -> FileItem? in
+                guard let url = Self.resolve(rel, vault: vaultURL),
+                      FileManager.default.fileExists(atPath: url.path) else { return nil }
+                return vaultManager.findInTree(id: url.standardizedFileURL.path)
+                    ?? FileItem(url: url, isDirectory: Self.isDirectory(url))
+            }
+            guard !items.isEmpty else {
+                return .json(["error": "Nothing to move"], status: 400)
+            }
+            let before = (jsonBody?["before"] as? String)
+                .flatMap { Self.resolve($0, vault: vaultURL) }?
+                .lastPathComponent
+            let remap = vaultManager.reorderItems(items, into: destination, before: before)
+            // Handed back vault-relative, since absolute paths mean nothing
+            // to the client — it needs them to follow a moved note that is
+            // currently open, and to keep collapsed folders collapsed.
+            var moved: [String: String] = [:]
+            for (from, to) in remap {
+                moved[Self.relative(URL(fileURLWithPath: from), vault: vaultURL)] =
+                    Self.relative(URL(fileURLWithPath: to), vault: vaultURL)
+            }
+            return .json(["ok": true, "moved": moved] as [String: Any])
+
+        case ("POST", "/api/tree/order/clear"):
+            // Undoes a manual drag order, putting a folder back in name
+            // order. Without this a single reorder would freeze that folder
+            // out of alphabetical sorting permanently from the web client.
+            guard let folder = Self.resolve(jsonBody?["path"] as? String ?? "", vault: vaultURL),
+                  Self.isDirectory(folder) else {
+                return .json(["error": "Not a folder"], status: 400)
+            }
+            vaultManager.clearManualOrder(of: folder)
+            return .json(["ok": true])
+
+        case ("POST", "/api/import"):
+            // Files dragged in from the desktop onto the web client. The
+            // browser can only give us bytes, so unlike the native drop
+            // these are written rather than copied from a source URL.
+            guard let destination = Self.resolve(jsonBody?["destination"] as? String ?? "", vault: vaultURL),
+                  Self.isDirectory(destination) else {
+                return .json(["error": "Destination is not a folder"], status: 400)
+            }
+            let uploads: [VaultManager.Upload] = (jsonBody?["files"] as? [[String: Any]] ?? []).compactMap {
+                guard let name = $0["path"] as? String,
+                      let encoded = $0["data"] as? String,
+                      let bytes = Data(base64Encoded: encoded) else { return nil }
+                return VaultManager.Upload(relativePath: name, data: bytes)
+            }
+            guard !uploads.isEmpty else {
+                return .json(["error": "No files"], status: 400)
+            }
+            let written = vaultManager.importUploads(uploads, into: destination)
+            return .json([
+                "ok": true,
+                "imported": written.count,
+                "skipped": uploads.count - written.count,
+                "paths": written.map { Self.relative($0, vault: vaultURL) }
+            ] as [String: Any])
+
         case ("DELETE", "/api/note"):
             guard let rel = request.query["path"], let url = Self.resolve(rel, vault: vaultURL) else {
                 return .json(["error": "Missing path"], status: 400)
@@ -310,8 +398,11 @@ final class NoteServer: ObservableObject {
             guard let rel = request.query["path"], let url = Self.resolve(rel, vault: vaultURL) else {
                 return .json(["error": "Missing path"], status: 400)
             }
-            guard FileManager.default.fileExists(atPath: url.path),
-                  let data = try? Data(contentsOf: url) else {
+            // Mapped rather than copied: an embedded image, PDF or video is
+            // otherwise read wholly onto the heap only to be handed straight
+            // to the socket. A missing file fails the read, so the separate
+            // `fileExists` stat this used to do first was redundant.
+            guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
                 return HTTPResponse(status: 404, body: Data("Not found".utf8))
             }
             return HTTPResponse(status: 200, contentType: Self.mime(url.pathExtension), body: data)
@@ -321,9 +412,24 @@ final class NoteServer: ObservableObject {
         }
     }
 
-    private func serveStatic(path rawPath: String) -> HTTPResponse {
-        let trimmed = rawPath.split(separator: "?").first.map(String.init) ?? rawPath
-        var relative = trimmed == "/" ? "index.html" : String(trimmed.dropFirst())
+    /// One bundled web asset: its bytes plus the validators a browser needs to
+    /// stop asking for them again.
+    private struct StaticAsset {
+        let data: Data
+        let contentType: String
+        let etag: String
+        let lastModified: String
+    }
+
+    /// The web UI ships inside the app bundle and cannot change while the app
+    /// is running, so each file is read from disk exactly once per launch and
+    /// every later hit is answered from memory — or, once the browser holds
+    /// the ETag, with a bodyless 304. The whole set is well under 100 KB,
+    /// which is the point when the server is the only live subsystem.
+    private var staticAssets: [String: StaticAsset] = [:]
+
+    private func serveStatic(_ request: HTTPRequest) -> HTTPResponse {
+        var relative = request.path == "/" ? "index.html" : String(request.path.dropFirst())
         if relative.hasSuffix("/") { relative += "index.html" }
         if relative.contains("..") {
             return HTTPResponse(status: 403, body: Data("Forbidden".utf8))
@@ -331,14 +437,57 @@ final class NoteServer: ObservableObject {
         guard let root = Self.webRoot() else {
             return HTTPResponse(status: 500, body: Data("Web UI missing".utf8))
         }
-        var file = root.appendingPathComponent(relative)
-        if !FileManager.default.fileExists(atPath: file.path) {
-            file = root.appendingPathComponent("index.html")
-        }
-        guard let data = try? Data(contentsOf: file) else {
+        // Unknown paths still fall through to the single-page app's entry
+        // point, resolved to that name first so the cache holds one entry for
+        // index.html rather than one per URL a client happens to ask for.
+        guard let asset = staticAsset(relative, under: root) ?? staticAsset("index.html", under: root) else {
             return HTTPResponse(status: 404, body: Data("Not found".utf8))
         }
-        return HTTPResponse(status: 200, contentType: Self.mime(file.pathExtension), body: data)
+        // `no-cache` rather than a long `max-age`: these filenames carry no
+        // content hash, so an app update has to be able to invalidate them
+        // immediately. The conditional request still costs a couple of hundred
+        // bytes instead of the whole file.
+        let validators = [
+            "ETag": asset.etag,
+            "Last-Modified": asset.lastModified,
+            "Cache-Control": "no-cache"
+        ]
+        if request.headers["if-none-match"] == asset.etag
+            || request.headers["if-modified-since"] == asset.lastModified {
+            return HTTPResponse(status: 304, contentType: asset.contentType, body: Data(), extraHeaders: validators)
+        }
+        return HTTPResponse(status: 200, contentType: asset.contentType, body: asset.data, extraHeaders: validators)
+    }
+
+    private func staticAsset(_ relative: String, under root: URL) -> StaticAsset? {
+        if let cached = staticAssets[relative] { return cached }
+        let file = root.appendingPathComponent(relative)
+        guard let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              let size = values.fileSize,
+              let data = try? Data(contentsOf: file) else { return nil }
+        let modified = values.contentModificationDate ?? Date(timeIntervalSince1970: 0)
+        let asset = StaticAsset(
+            data: data,
+            contentType: Self.mime(file.pathExtension),
+            etag: "\"\(String(size, radix: 16))-\(String(Int(modified.timeIntervalSince1970), radix: 16))\"",
+            lastModified: Self.httpDate(modified)
+        )
+        // Everything the bundle can plausibly hold here is a few KB; the cap
+        // only stops something unexpectedly large from being pinned for the
+        // life of the process.
+        if data.count <= 2 * 1024 * 1024 { staticAssets[relative] = asset }
+        return asset
+    }
+
+    /// RFC 1123 date for `Last-Modified`. Built per call rather than kept in a
+    /// shared formatter: this runs once per asset per launch, and
+    /// `DateFormatter` is not `Sendable`.
+    private static func httpDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        return formatter.string(from: date)
     }
 
     /// Resolved once and reused: every static asset a browsing session pulls
@@ -365,12 +514,14 @@ final class NoteServer: ObservableObject {
 
     private static func webRoot() -> URL? { cachedWebRoot }
 
-    private static func encode(_ item: FileItem, vault: URL) -> APINode {
+    @MainActor
+    private static func encode(_ item: FileItem, vault: URL, manager: VaultManager) -> APINode {
         APINode(
             title: item.displayTitle,
             path: relative(item.url, vault: vault),
             isDirectory: item.isDirectory,
-            children: item.children?.map { encode($0, vault: vault) }
+            manualOrder: item.isDirectory && manager.hasManualOrder(item.url) ? true : nil,
+            children: item.children?.map { encode($0, vault: vault, manager: manager) }
         )
     }
 
@@ -423,12 +574,23 @@ final class NoteServer: ObservableObject {
 }
 
 enum HTTPConnection {
+    /// A client that keeps sending without ever completing a request is
+    /// otherwise unbounded memory in a process that may have no windows open
+    /// at all. Generous enough for any note or attachment a `PUT` carries.
+    private static let maxRequestBytes = 64 * 1024 * 1024
+
     static func receive(on connection: NWConnection, complete: @escaping @Sendable (HTTPRequest) -> Void) {
-        let box = BufferBox()
-        func loop() {
+        let buffer = RequestBuffer()
+        @Sendable func loop() {
             connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
-                if let data { box.data.append(data) }
-                if let request = HTTPRequest.parse(box.data) {
+                if let data, !data.isEmpty {
+                    buffer.append(data)
+                    if buffer.byteCount > maxRequestBytes {
+                        connection.cancel()
+                        return
+                    }
+                }
+                if let request = buffer.completedRequest() {
                     complete(request)
                     return
                 }
@@ -443,28 +605,77 @@ enum HTTPConnection {
     }
 
     static func send(_ response: HTTPResponse, on connection: NWConnection) {
-        connection.send(content: response.serialized(), completion: .contentProcessed { _ in
+        let head = response.headerData()
+        let body = response.body
+        guard !body.isEmpty else {
+            connection.send(content: head, completion: .contentProcessed { _ in connection.cancel() })
+            return
+        }
+        // Two ordered sends rather than one joined blob: `NWConnection` keeps
+        // them in sequence, and joining them copied every byte of the body a
+        // second time just to prepend ~250 bytes of header.
+        connection.send(content: head, completion: .contentProcessed { _ in })
+        connection.send(content: body, completion: .contentProcessed { _ in
             connection.cancel()
         })
     }
 }
 
-final class BufferBox: @unchecked Sendable {
-    var data = Data()
+/// Accumulates one request across reads. The header block is parsed exactly
+/// once: re-running a whole-buffer parse after every 64 KB chunk made a large
+/// `PUT` quadratic — each chunk rescanned every byte received so far for the
+/// `\r\n\r\n` terminator and rebuilt the header dictionary from scratch.
+final class RequestBuffer: @unchecked Sendable {
+    private static let terminator = Data("\r\n\r\n".utf8)
+
+    private var data = Data()
+    private var searched = 0
+    private var head: HTTPRequestHead?
+    private var bodyStart = 0
+    private var contentLength = 0
+
+    var byteCount: Int { data.count }
+
+    func append(_ chunk: Data) {
+        data.append(chunk)
+    }
+
+    func completedRequest() -> HTTPRequest? {
+        if head == nil {
+            guard data.count >= Self.terminator.count else { return nil }
+            // Back the scan up by the terminator's length so one straddling a
+            // chunk boundary is still found, without restarting from byte 0.
+            let from = max(searched - (Self.terminator.count - 1), 0)
+            let lower = data.index(data.startIndex, offsetBy: from)
+            guard let range = data.range(of: Self.terminator, in: lower..<data.endIndex) else {
+                searched = data.count
+                return nil
+            }
+            guard let parsed = HTTPRequestHead.parse(data[data.startIndex..<range.lowerBound]) else { return nil }
+            head = parsed
+            bodyStart = range.upperBound - data.startIndex
+            contentLength = Int(parsed.headers["content-length"] ?? "0") ?? 0
+        }
+        guard let head = head, data.count - bodyStart >= contentLength else { return nil }
+        let start = data.index(data.startIndex, offsetBy: bodyStart)
+        return HTTPRequest(
+            method: head.method,
+            path: head.path,
+            headers: head.headers,
+            body: Data(data[start..<data.index(start, offsetBy: contentLength)]),
+            query: head.query
+        )
+    }
 }
 
-struct HTTPRequest: Sendable {
+/// A request line plus its headers, without the body.
+struct HTTPRequestHead: Sendable {
     var method: String
     var path: String
     var headers: [String: String]
-    var body: Data
     var query: [String: String]
 
-    var bodyString: String { String(data: body, encoding: .utf8) ?? "" }
-
-    static func parse(_ data: Data) -> HTTPRequest? {
-        guard let headerRange = data.range(of: Data("\r\n\r\n".utf8)) else { return nil }
-        let headerData = data.subdata(in: data.startIndex..<headerRange.lowerBound)
+    static func parse(_ headerData: Data) -> HTTPRequestHead? {
         guard let headerText = String(data: headerData, encoding: .utf8) else { return nil }
         let lines = headerText.split(separator: "\r\n", omittingEmptySubsequences: false).map(String.init)
         guard let requestLine = lines.first else { return nil }
@@ -477,11 +688,6 @@ struct HTTPRequest: Sendable {
             let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
             headers[key] = value
         }
-        let contentLength = Int(headers["content-length"] ?? "0") ?? 0
-        let bodyStart = headerRange.upperBound
-        let have = data.count - bodyStart
-        if have < contentLength { return nil }
-        let body = data.subdata(in: bodyStart..<(bodyStart + contentLength))
         let fullPath = parts[1]
         let pathParts = fullPath.split(separator: "?", maxSplits: 1).map(String.init)
         let path = pathParts.first ?? "/"
@@ -494,17 +700,33 @@ struct HTTPRequest: Sendable {
                 }
             }
         }
-        return HTTPRequest(method: parts[0], path: path, headers: headers, body: body, query: query)
+        return HTTPRequestHead(method: parts[0], path: path, headers: headers, query: query)
     }
+}
+
+struct HTTPRequest: Sendable {
+    var method: String
+    var path: String
+    var headers: [String: String]
+    var body: Data
+    var query: [String: String]
+
+    var bodyString: String { String(data: body, encoding: .utf8) ?? "" }
 }
 
 struct HTTPResponse: Sendable {
     var status: Int
     var contentType: String = "text/plain; charset=utf-8"
     var body: Data
+    /// Caching validators and anything else route-specific. Declared last so
+    /// every existing `HTTPResponse(status:body:)` call site is unchanged.
+    var extraHeaders: [String: String] = [:]
 
     static func json(_ object: Any, status: Int = 200) -> HTTPResponse {
-        let data = (try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted])) ?? Data("{}".utf8)
+        // No `.prettyPrinted`: the only consumer is `app.js`, and on the
+        // array-of-objects payloads that come through here — `/api/graph`
+        // above all — the indentation was a large fraction of the bytes.
+        let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
         return HTTPResponse(status: status, contentType: "application/json; charset=utf-8", body: data)
     }
 
@@ -513,11 +735,14 @@ struct HTTPResponse: Sendable {
         return HTTPResponse(status: status, contentType: "application/json; charset=utf-8", body: data)
     }
 
-    func serialized() -> Data {
+    /// Status line and headers only — the body goes out as its own send so a
+    /// large attachment isn't copied again just to prepend these bytes.
+    func headerData() -> Data {
         let reason: String
         switch status {
         case 200: reason = "OK"
         case 204: reason = "No Content"
+        case 304: reason = "Not Modified"
         case 400: reason = "Bad Request"
         case 403: reason = "Forbidden"
         case 404: reason = "Not Found"
@@ -525,9 +750,11 @@ struct HTTPResponse: Sendable {
         case 503: reason = "Service Unavailable"
         default: reason = "OK"
         }
-        let header = "HTTP/1.1 \(status) \(reason)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.count)\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n"
-        var data = Data(header.utf8)
-        data.append(body)
-        return data
+        var header = "HTTP/1.1 \(status) \(reason)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.count)\r\n"
+        for (name, value) in extraHeaders {
+            header += "\(name): \(value)\r\n"
+        }
+        header += "Connection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n\r\n"
+        return Data(header.utf8)
     }
 }

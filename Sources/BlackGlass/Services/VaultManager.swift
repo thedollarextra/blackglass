@@ -5,7 +5,10 @@ import Combine
 public final class VaultManager: ObservableObject {
     @Published public var vaults: [Vault] = []
     @Published public var activeVault: Vault?
-    @Published public var fileTree: [FileItem] = []
+    /// Written only through `setFileTree`, which is what keeps the flattened
+    /// row cache behind `visibleFlattenedItems` from going stale — hence
+    /// `private(set)`, so a direct assignment can't quietly bypass it.
+    @Published public private(set) var fileTree: [FileItem] = []
     /// Last trashed batch, restorable via `undoLastDelete()`. Shared across
     /// windows since it mirrors a real filesystem action, not window UI state.
     @Published public private(set) var lastDelete: DeletedBatch?
@@ -60,6 +63,22 @@ public final class VaultManager: ObservableObject {
     private func invalidateGraphCache() {
         guard let active = activeVault else { return }
         graphCache[active.id] = nil
+    }
+
+    /// Last result of `visibleFlattenedItems`, keyed by the collapsed-folder
+    /// set it was built for. Dropped whenever the tree itself changes.
+    private var flattenedCache: (collapsed: Set<String>, rows: [FlatRow])?
+
+    /// Last whole-tree `findInTree` hit. Several view bodies resolve the same
+    /// selected id on every redraw, and each miss walks the entire vault.
+    private var lastFound: FileItem?
+
+    /// The only place `fileTree` is assigned, so neither cache can outlive the
+    /// tree it was derived from.
+    private func setFileTree(_ items: [FileItem]) {
+        flattenedCache = nil
+        lastFound = nil
+        fileTree = items
     }
 
     public init() {
@@ -119,7 +138,7 @@ public final class VaultManager: ObservableObject {
                 selectVault(first)
             } else {
                 activeVault = nil
-                fileTree = []
+                setFileTree([])
                 UserDefaults.standard.removeObject(forKey: lastVaultKey)
             }
         }
@@ -129,11 +148,11 @@ public final class VaultManager: ObservableObject {
     /// through the incremental index hooks instead of a full reindex.
     public func refreshFileTree() {
         guard let active = activeVault, active.exists else {
-            fileTree = []
+            setFileTree([])
             indexer.clear()
             return
         }
-        fileTree = loadDirectory(at: active.url)
+        setFileTree(loadDirectory(at: active.url))
     }
 
     /// Full reindex of the active vault. Only on vault switch, launch, or the
@@ -161,20 +180,38 @@ public final class VaultManager: ObservableObject {
     /// so hand its memory back; a rebuild takes a fraction of a second. The
     /// graph cache only ever serves the native Graph view, so it goes back
     /// regardless of server state — nothing else reads it.
+    ///
+    /// The file tree goes back regardless of server state too. It used to be
+    /// tied to the index's `!serverRunning` guard, which meant a menu-bar-only
+    /// session with the server on held every `FileItem` in the vault — two
+    /// strings, a URL and a child array each — for nobody: the only thing that
+    /// reads `fileTree` without a window is `/api/tree`, and every server
+    /// handler that touches the tree calls `refreshFileTree()` first anyway.
     public func suspendIndexIfUnused(serverRunning: Bool) {
         graphCache.removeAll()
-        guard !serverRunning, !indexSuspended, activeVault != nil else { return }
-        indexer.clear()
-        fileTree = []
-        indexSuspended = true
+        guard activeVault != nil else { return }
+        if !fileTree.isEmpty { setFileTree([]) }
+        if !serverRunning, !indexSuspended {
+            indexer.clear()
+            indexSuspended = true
+        }
         BlackGlassMemory.releaseIdle()
     }
 
+    /// Invariant this restores: a window is on screen, so the tree must be
+    /// loaded. Checking `fileTree` rather than only `indexSuspended` matters
+    /// because the suspend path drops the tree even when it leaves the index
+    /// resident for the server — without this the first sidebar after a
+    /// menu-bar-only stretch would render empty.
     public func resumeIndexIfSuspended() {
-        guard indexSuspended else { return }
-        indexSuspended = false
-        refreshFileTree()
-        rebuildIndex()
+        guard let active = activeVault else { return }
+        if indexSuspended {
+            indexSuspended = false
+            refreshFileTree()
+            rebuildIndex()
+        } else if fileTree.isEmpty, active.exists {
+            refreshFileTree()
+        }
     }
 
     func flattenNotes(_ items: [FileItem]? = nil) -> [FileItem] {
@@ -201,15 +238,27 @@ public final class VaultManager: ObservableObject {
     /// notes had to materialize every row (and every folder below it) up
     /// front, which is what made opening or closing a window slow to begin
     /// with; a flat list is what SwiftUI can actually virtualize.
-    public func visibleFlattenedItems(collapsed: Set<String>, items: [FileItem]? = nil, depth: Int = 0) -> [FlatRow] {
+    ///
+    /// Memoized because the sidebar reads it once per body evaluation — which
+    /// means once per keystroke in the search field and once per selection
+    /// change — while the walk itself is O(vault). The single cache entry is
+    /// enough: a second window with a different set of collapsed folders just
+    /// evicts it, costing exactly the walk that would have happened anyway.
+    public func visibleFlattenedItems(collapsed: Set<String>) -> [FlatRow] {
+        if let cached = flattenedCache, cached.collapsed == collapsed { return cached.rows }
         var out: [FlatRow] = []
-        for item in items ?? fileTree {
+        appendFlattened(fileTree, collapsed: collapsed, depth: 0, into: &out)
+        flattenedCache = (collapsed, out)
+        return out
+    }
+
+    private func appendFlattened(_ items: [FileItem], collapsed: Set<String>, depth: Int, into out: inout [FlatRow]) {
+        for item in items {
             out.append(FlatRow(item: item, depth: depth))
             if item.isDirectory, !collapsed.contains(item.id), let children = item.children {
-                out.append(contentsOf: visibleFlattenedItems(collapsed: collapsed, items: children, depth: depth + 1))
+                appendFlattened(children, collapsed: collapsed, depth: depth + 1, into: &out)
             }
         }
-        return out
     }
 
     /// Just the IDs, in the same order — the range a shift-click selects along.
@@ -236,9 +285,14 @@ public final class VaultManager: ObservableObject {
     /// re-entered `fileTree` whenever it reached a leaf (files carry a nil
     /// `children`), so any miss recursed forever and blew the stack.
     public func findInTree(id: String, in items: [FileItem]? = nil) -> FileItem? {
+        let wholeTree = items == nil
+        if wholeTree, let lastFound, lastFound.id == id { return lastFound }
         var stack = items ?? fileTree
         while let node = stack.popLast() {
-            if node.id == id { return node }
+            if node.id == id {
+                if wholeTree { lastFound = node }
+                return node
+            }
             if let children = node.children, !children.isEmpty {
                 stack.append(contentsOf: children)
             }
@@ -367,8 +421,18 @@ public final class VaultManager: ObservableObject {
             }
         }
 
-        invalidateGraphCache()
-        refreshFileTree()
+        // Only when the item actually moved. `dest` still equals `item.url`
+        // when the typed name matched the existing one — Enter on an unedited
+        // field, which is how a freshly created note's pre-filled name gets
+        // accepted — or when the move failed; either way the vault on disk is
+        // untouched (`updateHeading` sees an unchanged title and returns), so
+        // the tree has nothing new to show and the graph's link set can't have
+        // changed. This was costing a full recursive walk of the vault and a
+        // forced graph rebuild for a rename that renamed nothing.
+        if dest.standardizedFileURL.path != item.url.standardizedFileURL.path {
+            invalidateGraphCache()
+            refreshFileTree()
+        }
         if focusEditor && !item.isDirectory {
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .blackGlassFocusEditor, object: nil)
@@ -455,8 +519,11 @@ public final class VaultManager: ObservableObject {
         // A plain drop *into* a folder shouldn't silently freeze that folder
         // into manual order for good — it only earns an order once something
         // is deliberately positioned in it, or if it already had one.
+        //
+        // No refresh here: `moveItems` already did one if anything actually
+        // moved, and if nothing did there is nothing to redraw. This was a
+        // second full recursive walk of the whole vault per drag.
         guard beforeName != nil || treeOrder.currentOrder(in: destFolder) != nil else {
-            refreshFileTree()
             return remap
         }
 
@@ -544,6 +611,90 @@ public final class VaultManager: ObservableObject {
         guard imported > 0 else { return }
         invalidateGraphCache()
         refreshFileTree()
+    }
+
+    /// One file handed over by a browser drop: its bytes plus the path it
+    /// had relative to whatever was dropped, so a dropped folder keeps its
+    /// shape on the way in.
+    public struct Upload: Sendable {
+        public let relativePath: String
+        public let data: Data
+
+        public init(relativePath: String, data: Data) {
+            self.relativePath = relativePath
+            self.data = data
+        }
+    }
+
+    /// Web counterpart to `importFiles`. A browser can't hand over URLs the
+    /// app could go and read for itself, so a drop onto the web client
+    /// arrives as bytes and has to be written rather than copied. Returns
+    /// the files that actually landed.
+    @discardableResult
+    public func importUploads(_ uploads: [Upload], into destinationFolder: URL) -> [URL] {
+        guard let active = activeVault else { return [] }
+        let destFolder = destinationFolder.standardizedFileURL
+        var landed: [URL] = []
+        var skipped = 0
+        // A dropped folder arrives as one upload per file inside it, so the
+        // name each directory resolves to has to be decided once and reused.
+        // Picking a fresh unique name per file would scatter one dropped
+        // folder across "Notes", "Notes 2", "Notes 3"...
+        var folders: [String: URL] = [:]
+
+        for upload in uploads {
+            let parts = upload.relativePath
+                .split(separator: "/")
+                .map(String.init)
+                .filter { !$0.isEmpty && $0 != "." && $0 != ".." }
+            guard let name = parts.last else { continue }
+            guard Self.importableExtensions.contains((name as NSString).pathExtension.lowercased()) else {
+                skipped += 1
+                continue
+            }
+
+            var parent = destFolder
+            for (depth, component) in parts.dropLast().enumerated() {
+                let key = parts[0...depth].joined(separator: "/")
+                if let known = folders[key] {
+                    parent = known
+                    continue
+                }
+                // Only the outermost component competes for a unique name.
+                // Everything below it lives inside a folder that is already
+                // new, so it keeps the name it was dropped with.
+                let child = depth == 0
+                    ? uniqueDirectoryURL(in: parent, stem: component)
+                    : parent.appendingPathComponent(component)
+                folders[key] = child
+                parent = child
+            }
+
+            guard (try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)) != nil else {
+                skipped += 1
+                continue
+            }
+            let dest = uniqueURL(
+                in: parent,
+                stem: (name as NSString).deletingPathExtension,
+                ext: (name as NSString).pathExtension
+            )
+            do {
+                try upload.data.write(to: dest, options: .atomic)
+            } catch {
+                NSLog("BlackGlass upload failed: \(error.localizedDescription)")
+                skipped += 1
+                continue
+            }
+            indexer.noteAdded(url: dest, vault: active.url)
+            landed.append(dest)
+        }
+
+        lastImportSummary = Self.importSummary(imported: landed.count, skipped: skipped)
+        guard !landed.isEmpty else { return [] }
+        invalidateGraphCache()
+        refreshFileTree()
+        return landed
     }
 
     /// Copies one file in, if its type is importable. Returns whether it landed.
@@ -723,11 +874,11 @@ public final class VaultManager: ObservableObject {
             if isDir {
                 let subItems = loadDirectory(at: fileURL)
                 items.append(FileItem(url: fileURL, isDirectory: true, children: subItems, modifiedAt: modDate))
-            } else {
-                let ext = fileURL.pathExtension.lowercased()
-                if ["md", "markdown", "txt"].contains(ext) {
-                    items.append(FileItem(url: fileURL, isDirectory: false, modifiedAt: modDate))
-                }
+            } else if Self.importableExtensions.contains(fileURL.pathExtension.lowercased()) {
+                // The shared set rather than an array literal: this is the
+                // inner loop of a full-vault walk, and the literal was
+                // allocating a three-element array once per file in the vault.
+                items.append(FileItem(url: fileURL, isDirectory: false, modifiedAt: modDate))
             }
         }
         return items

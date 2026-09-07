@@ -100,7 +100,12 @@
     sheetCard: $("sheetCard"),
   };
 
-  const isPhone = () => window.matchMedia("(max-width: 760px)").matches;
+  // One MediaQueryList each rather than one per call: `isPhone()` runs on
+  // every touch start, sidebar toggle and note open, and each `matchMedia`
+  // call allocates a fresh list and re-evaluates the query.
+  const phoneQuery = window.matchMedia("(max-width: 760px)");
+  const lightQuery = window.matchMedia("(prefers-color-scheme: light)");
+  const isPhone = () => phoneQuery.matches;
   const isTypingTarget = (el) =>
     el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
 
@@ -186,19 +191,26 @@
   }
 
   function renderTree() {
-    els.tree.innerHTML = "";
+    // Built off-document and attached in one go: appending row by row to the
+    // live tree made the browser lay out after every row, which on a few
+    // thousand notes is most of what a refresh costs.
+    const frag = document.createDocumentFragment();
     if (state.searching && state.query.trim()) {
       if (!state.results.length) {
         const empty = document.createElement("div");
         empty.className = "snippet";
         empty.textContent = "No notes found";
-        els.tree.appendChild(empty);
-        return;
+        frag.appendChild(empty);
+      } else {
+        state.results.forEach((r) => frag.appendChild(fileRow(r.path, r.title, r.snippet)));
       }
-      state.results.forEach((r) => els.tree.appendChild(fileRow(r.path, r.title, r.snippet)));
+      els.tree.innerHTML = "";
+      els.tree.appendChild(frag);
       return;
     }
-    (state.tree || []).forEach((n) => els.tree.appendChild(nodeEl(n, 0)));
+    (state.tree || []).forEach((n) => frag.appendChild(nodeEl(n, 0)));
+    els.tree.innerHTML = "";
+    els.tree.appendChild(frag);
     if (state.renamingPath) {
       const input = els.tree.querySelector(".rename-input");
       if (input) {
@@ -206,6 +218,18 @@
         input.select();
       }
     }
+  }
+
+  // Moves the highlight and nothing else. Opening a note or picking a folder
+  // used to call `renderTree()`, which threw away and rebuilt every row —
+  // and every row's four event listeners — to change one class.
+  function syncTreeSelection() {
+    els.tree.querySelectorAll(".row.selected").forEach((el) => el.classList.remove("selected"));
+    [state.path, state.selectedDir].forEach((p) => {
+      if (!p) return;
+      const row = rowForPath(p);
+      if (row) row.classList.add("selected");
+    });
   }
 
   function ancestorDirs(path) {
@@ -225,7 +249,13 @@
   }
 
   function rowForPath(path) {
-    return [...els.tree.querySelectorAll("[data-path]")].find((el) => el.getAttribute("data-path") === path);
+    // Scanned in place — the spread this used to do copied every row in the
+    // tree into a throwaway array before looking at the first one.
+    const rows = els.tree.querySelectorAll("[data-path]");
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].getAttribute("data-path") === path) return rows[i];
+    }
+    return null;
   }
 
   function revealSelectionInTree() {
@@ -298,9 +328,16 @@
         els.noteTitle.textContent = node.title;
         els.rawEditor.value = "";
         els.cookedView.innerHTML = "";
-        renderTree();
+        syncTreeSelection();
       });
-      bindItemMenu(row, { path: node.path, title: node.title, isDirectory: true });
+      const dirItem = {
+        path: node.path,
+        title: node.title,
+        isDirectory: true,
+        manualOrder: !!node.manualOrder,
+      };
+      bindItemMenu(row, dirItem);
+      bindItemDrag(row, dirItem);
       (node.children || []).forEach((c) => kids.appendChild(nodeEl(c, depth + 1)));
       wrap.append(row, kids);
       return wrap;
@@ -350,7 +387,9 @@
       if (state.renamingPath === path) return;
       openNote(path);
     });
-    bindItemMenu(row, { path, title, isDirectory: false });
+    const fileItem = { path, title, isDirectory: false };
+    bindItemMenu(row, fileItem);
+    if (!snippet) bindItemDrag(row, fileItem);
 
     if (snippet) {
       const wrap = document.createElement("div");
@@ -363,33 +402,13 @@
     return row;
   }
 
+  // Right-click only. The touch long press used to live here too, but it has
+  // to decide between opening the menu and picking the row up, so it moved
+  // into `bindItemDrag` where that state is.
   function bindItemMenu(row, item) {
     row.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       showContextMenu(e.clientX, e.clientY, item);
-    });
-    let timer = null;
-    row.addEventListener("touchstart", (e) => {
-      if (e.touches.length !== 1) return;
-      const t = e.touches[0];
-      timer = setTimeout(() => {
-        showSheet(item);
-        timer = null;
-      }, 520);
-      row._sx = t.clientX;
-      row._sy = t.clientY;
-    }, { passive: true });
-    row.addEventListener("touchmove", (e) => {
-      if (!timer || e.touches.length !== 1) return;
-      const t = e.touches[0];
-      if (Math.abs(t.clientX - row._sx) > 10 || Math.abs(t.clientY - row._sy) > 10) {
-        clearTimeout(timer);
-        timer = null;
-      }
-    }, { passive: true });
-    row.addEventListener("touchend", () => {
-      if (timer) clearTimeout(timer);
-      timer = null;
     });
   }
 
@@ -408,6 +427,7 @@
     if (item.isDirectory) {
       add("Expand All", () => expandAllUnder(item.path));
       add("Collapse All", () => collapseAllUnder(item.path));
+      if (item.manualOrder) add("Sort by Name", () => clearManualOrder(item.path));
     }
     add("Rename", () => startRename(item.path, item.title));
     add("Delete", () => deleteNote(item.path, item.isDirectory), true);
@@ -432,6 +452,7 @@
     if (item.isDirectory) {
       add("Expand All", () => expandAllUnder(item.path));
       add("Collapse All", () => collapseAllUnder(item.path));
+      if (item.manualOrder) add("Sort by Name", () => clearManualOrder(item.path));
     }
     add("Rename", () => startRename(item.path, item.title));
     add("Delete", () => deleteNote(item.path, item.isDirectory), true);
@@ -458,6 +479,9 @@
     if (state.renamingPath !== path && !focusEditor) return;
     state.renamingPath = null;
     try {
+      // Ahead of the rename, so a queued write can't recreate the old
+      // filename a moment after the file moves.
+      await flushSave().catch(console.error);
       const res = await api("/api/note", {
         method: "PATCH",
         body: JSON.stringify({ path, title }),
@@ -498,6 +522,12 @@
       ? "Move this folder and everything inside it to Trash?"
       : "Move this note to Trash?";
     if (!confirm(msg)) return;
+    // Otherwise a save queued seconds ago fires after the delete and writes
+    // the file straight back.
+    if (pendingSave && (pendingSave.path === path
+        || (isDirectory && pendingSave.path.startsWith(path + "/")))) {
+      dropPendingSave();
+    }
     await api("/api/note?path=" + encodeURIComponent(path), { method: "DELETE" });
     if (state.path === path || (isDirectory && state.path && state.path.startsWith(path + "/"))) {
       state.path = null;
@@ -516,6 +546,9 @@
   }
 
   async function openNote(path) {
+    // Land whatever is still queued for the note we're leaving before its
+    // buffer is overwritten below.
+    await flushSave().catch(console.error);
     const note = await api("/api/note?path=" + encodeURIComponent(path));
     state.path = path;
     state.selectedDir = null;
@@ -525,30 +558,61 @@
     els.noteTitle.textContent = note.title;
     els.rawEditor.value = note.content;
     renderCooked();
-    renderTree();
+    syncTreeSelection();
     if (isPhone()) closeSidebar();
   }
+
+  // The queued write is bound to the note it came from. The timer used to read
+  // `state.path` and `state.content` at the moment it fired, so switching
+  // notes inside the 300ms window PUT the *new* note's text back to the new
+  // note and silently dropped the edit to the old one.
+  let pendingSave = null;
 
   function queueSave() {
     state.content = els.rawEditor.value;
     if (state.mode === "cooked") renderCooked();
     clearTimeout(state.saveTimer);
     if (!state.path) return;
-    state.saveTimer = setTimeout(async () => {
-      await api("/api/note?path=" + encodeURIComponent(state.path), {
-        method: "PUT",
-        body: JSON.stringify({ content: state.content }),
-      });
+    pendingSave = { path: state.path, content: state.content };
+    state.saveTimer = setTimeout(() => {
+      state.saveTimer = null;
+      flushSave().catch(console.error);
     }, 300);
   }
 
+  async function flushSave() {
+    if (!pendingSave) return;
+    const { path, content } = pendingSave;
+    pendingSave = null;
+    clearTimeout(state.saveTimer);
+    state.saveTimer = null;
+    await api("/api/note?path=" + encodeURIComponent(path), {
+      method: "PUT",
+      body: JSON.stringify({ content }),
+    });
+  }
+
+  function dropPendingSave() {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = null;
+    pendingSave = null;
+  }
+
+  // Renders are in flight across note switches, and the slower one used to
+  // win — painting the wrong note, then paying for its KaTeX and Mermaid
+  // passes on top.
+  let cookedSeq = 0;
+
   async function renderCooked() {
     if (!state.path) {
+      cookedSeq++;
       els.cookedView.innerHTML = "<p class='muted'>Select a note</p>";
       return;
     }
+    const seq = ++cookedSeq;
     try {
       const data = await api("/api/render?path=" + encodeURIComponent(state.path));
+      if (seq !== cookedSeq) return;
       els.cookedView.innerHTML = data.html || "";
       bindWikiClicks(els.cookedView);
       try {
@@ -565,6 +629,7 @@
         }
       } catch (e) { /* optional */ }
     } catch {
+      if (seq !== cookedSeq) return;
       els.cookedView.innerHTML = markdownToHtml(els.rawEditor.value);
     }
   }
@@ -666,6 +731,11 @@
     state.query = "";
     els.searchInput.value = "";
     state.results = [];
+    // Retires both a debounced keystroke and any request still in flight, so
+    // neither can repaint the tree with results for a closed search.
+    clearTimeout(searchTimer);
+    searchTimer = null;
+    searchSeq++;
     revealSelectionInTree();
   }
 
@@ -711,9 +781,13 @@
       node.y = h / 2 + Math.sin(a) * Math.min(w, h) * 0.28;
     });
     const idx = Object.fromEntries(nodes.map((node, i) => [node.id, i]));
+    // Allocated once and zeroed per pass — this used to build two fresh arrays
+    // on each of the 60 iterations.
+    const vx = new Array(n).fill(0);
+    const vy = new Array(n).fill(0);
     for (let iter = 0; iter < 60; iter++) {
-      const vx = nodes.map(() => 0);
-      const vy = nodes.map(() => 0);
+      vx.fill(0);
+      vy.fill(0);
       for (let i = 0; i < n; i++) {
         for (let j = i + 1; j < n; j++) {
           const dx = nodes[j].x - nodes[i].x;
@@ -767,37 +841,66 @@
       g.lineTo(b.x, b.y);
       g.stroke();
     });
+    // Read once. `getComputedStyle` was being called twice per node inside the
+    // loop, each one a forced style resolve, and the font and alignment were
+    // re-set just as often to the same values.
+    const textColor = getComputedStyle(document.body).color;
+    g.font = "11px -apple-system, sans-serif";
+    g.textAlign = "center";
     (state.graphNodes || []).forEach((n) => {
       g.beginPath();
       g.arc(n.x, n.y, n.unresolved ? 4 : 7, 0, Math.PI * 2);
-      g.fillStyle = n.unresolved ? "rgba(160,160,160,0.5)" : (n.path === state.path ? "#0a84ff" : getComputedStyle(document.body).color);
+      g.fillStyle = n.unresolved ? "rgba(160,160,160,0.5)" : (n.path === state.path ? "#0a84ff" : textColor);
       g.fill();
       if (!n.unresolved) {
-        g.fillStyle = getComputedStyle(document.body).color;
-        g.font = "11px -apple-system, sans-serif";
-        g.textAlign = "center";
+        g.fillStyle = textColor;
         g.fillText(n.title, n.x, n.y + 18);
       }
     });
   }
 
+  // Every search hits the Mac app's index on its main actor, so a request per
+  // keystroke is the wrong shape for a phone typing over the LAN. Coalesce the
+  // keystrokes, and discard any answer a later one has already superseded —
+  // responses can and do come back out of order.
+  let searchSeq = 0;
+  let searchTimer = null;
+
+  function scheduleSearch() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      searchTimer = null;
+      runSearch().catch(console.error);
+    }, 120);
+  }
+
   async function runSearch() {
+    const seq = ++searchSeq;
     state.query = els.searchInput.value;
     if (!state.query.trim()) {
       state.results = [];
       renderTree();
       return;
     }
-    state.results = await api("/api/search?q=" + encodeURIComponent(state.query));
+    const results = await api("/api/search?q=" + encodeURIComponent(state.query));
+    if (seq !== searchSeq) return;
+    state.results = results;
     renderTree();
   }
+
+  let omniSeq = 0;
+  let omniTimer = null;
 
   function openOmnibar() {
     state.omni = true;
     els.omnibar.hidden = false;
     els.omniInput.value = "";
+    state.omniQuery = "";
     state.omniResults = [];
     state.omniIndex = 0;
+    clearTimeout(omniTimer);
+    omniTimer = null;
+    omniSeq++;
     els.omniResults.innerHTML = "";
     els.omniInput.focus();
   }
@@ -805,38 +908,64 @@
   function closeOmnibar() {
     state.omni = false;
     els.omnibar.hidden = true;
+    clearTimeout(omniTimer);
+    omniTimer = null;
+    omniSeq++;
+  }
+
+  function scheduleOmni() {
+    clearTimeout(omniTimer);
+    omniTimer = setTimeout(() => {
+      omniTimer = null;
+      runOmni().catch(console.error);
+    }, 120);
   }
 
   async function runOmni() {
+    const seq = ++omniSeq;
     state.omniQuery = els.omniInput.value;
     if (!state.omniQuery.trim()) {
       state.omniResults = [];
       renderOmni();
       return;
     }
-    state.omniResults = await api("/api/search?q=" + encodeURIComponent(state.omniQuery));
+    const results = await api("/api/search?q=" + encodeURIComponent(state.omniQuery));
+    if (seq !== omniSeq) return;
+    state.omniResults = results;
     state.omniIndex = 0;
     renderOmni();
   }
 
   function renderOmni() {
-    els.omniResults.innerHTML = "";
+    const frag = document.createDocumentFragment();
     if (!state.omniResults.length) {
       const empty = document.createElement("div");
       empty.className = "omni-hit";
       empty.textContent = state.omniQuery ? "No notes found" : "Type to search notes";
-      els.omniResults.appendChild(empty);
-      return;
+      frag.appendChild(empty);
+    } else {
+      state.omniResults.forEach((r, i) => {
+        const d = document.createElement("div");
+        d.className = "omni-hit" + (i === state.omniIndex ? " sel" : "");
+        d.innerHTML = `<div class="t"></div><div class="s"></div>`;
+        d.querySelector(".t").textContent = r.title;
+        d.querySelector(".s").textContent = r.snippet || r.path;
+        d.addEventListener("click", () => selectOmni(i));
+        frag.appendChild(d);
+      });
     }
-    state.omniResults.forEach((r, i) => {
-      const d = document.createElement("div");
-      d.className = "omni-hit" + (i === state.omniIndex ? " sel" : "");
-      d.innerHTML = `<div class="t"></div><div class="s"></div>`;
-      d.querySelector(".t").textContent = r.title;
-      d.querySelector(".s").textContent = r.snippet || r.path;
-      d.addEventListener("click", () => selectOmni(i));
-      els.omniResults.appendChild(d);
-    });
+    els.omniResults.innerHTML = "";
+    els.omniResults.appendChild(frag);
+  }
+
+  // Arrow keys only move the highlight; re-running `renderOmni` for that threw
+  // away and rebuilt every hit, and its click listener, per keypress.
+  function syncOmniSelection() {
+    if (!state.omniResults.length) return;
+    const hits = els.omniResults.children;
+    for (let i = 0; i < hits.length; i++) {
+      hits[i].classList.toggle("sel", i === state.omniIndex);
+    }
   }
 
   async function selectOmni(i) {
@@ -887,6 +1016,8 @@
     }, { passive: true });
     document.addEventListener("touchmove", (e) => {
       if (!tracking || e.touches.length !== 1) return;
+      // A note being carried across the sidebar is not a swipe at it.
+      if (drag.active) return;
       const t = e.touches[0];
       const dx = t.clientX - startX;
       const dy = t.clientY - startY;
@@ -913,12 +1044,12 @@
       if (e.key === "ArrowDown") {
         e.preventDefault();
         state.omniIndex = Math.min(state.omniIndex + 1, Math.max(0, state.omniResults.length - 1));
-        renderOmni();
+        syncOmniSelection();
       }
       if (e.key === "ArrowUp") {
         e.preventDefault();
         state.omniIndex = Math.max(state.omniIndex - 1, 0);
-        renderOmni();
+        syncOmniSelection();
       }
       if (e.key === "Enter") { e.preventDefault(); selectOmni(state.omniIndex); }
       return;
@@ -947,7 +1078,7 @@
 
   els.menuBtn.addEventListener("click", toggleSidebarPane);
   syncSidebarButton();
-  window.matchMedia("(max-width: 760px)").addEventListener("change", () => {
+  phoneQuery.addEventListener("change", () => {
     document.getElementById("app").classList.toggle("sidebar-collapsed", !isPhone() && state.sidebarCollapsed);
     syncSidebarButton();
   });
@@ -957,7 +1088,7 @@
   els.searchToggle.addEventListener("click", () => toggleSearch().catch(console.error));
   if (els.graphBtn) els.graphBtn.addEventListener("click", () => toggleGraph().catch(console.error));
   els.searchClose.addEventListener("click", () => toggleSearch().catch(console.error));
-  els.searchInput.addEventListener("input", () => runSearch().catch(console.error));
+  els.searchInput.addEventListener("input", scheduleSearch);
   els.searchInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && state.results[0]) openNote(state.results[0].path);
   });
@@ -983,7 +1114,20 @@
         openNote(hit.path).catch(console.error);
       }
     });
-    window.addEventListener("resize", () => { if (state.graph) { layoutGraph(); drawGraph(); } });
+    // The force layout is O(n²) over 60 passes, and mobile Safari fires
+    // `resize` for every URL-bar nudge and keyboard show — running it
+    // synchronously per event is what makes the graph feel stuck.
+    let graphResizeTimer = null;
+    window.addEventListener("resize", () => {
+      if (!state.graph) return;
+      clearTimeout(graphResizeTimer);
+      graphResizeTimer = setTimeout(() => {
+        graphResizeTimer = null;
+        if (!state.graph) return;
+        layoutGraph();
+        drawGraph();
+      }, 150);
+    });
   }
   els.vaultBtn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -992,7 +1136,7 @@
   els.omnibar.addEventListener("click", (e) => {
     if (e.target === els.omnibar) closeOmnibar();
   });
-  els.omniInput.addEventListener("input", () => runOmni().catch(console.error));
+  els.omniInput.addEventListener("input", scheduleOmni);
   els.sheet.addEventListener("click", (e) => {
     if (e.target === els.sheet) hideMenus();
   });
@@ -1012,7 +1156,7 @@
 
   function resolvedTheme(mode) {
     if (mode === "light" || mode === "dark") return mode;
-    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    return lightQuery.matches ? "light" : "dark";
   }
 
   function applyAppearance(mode) {
@@ -1087,6 +1231,579 @@
     }
   }
 
+  // ---- Tree drag and drop -------------------------------------------------
+  //
+  // Pointer events rather than the native HTML5 drag API: one code path then
+  // covers a mouse on the desktop and a long press on a phone, which
+  // `dragstart` never fires for. Dropping files *in* from the desktop is the
+  // one thing that must use the native API — only it carries the payload —
+  // and that lives in `bindExternalDrop` at the bottom.
+
+  const drag = {
+    item: null,
+    row: null,
+    pointerId: null,
+    startX: 0,
+    startY: 0,
+    lifted: false,
+    moved: false,
+    active: false,
+    index: null,
+    ghost: null,
+    line: null,
+    target: null,
+    into: null,
+    liftTimer: null,
+    springPath: null,
+    springTimer: null,
+    scrollTimer: null,
+    scrollBy: 0,
+  };
+
+  const DRAG_SLOP = 5;        // px of movement before a press becomes a drag
+  const LIFT_MS = 500;        // touch: hold this long to pick a row up
+  const SPRING_MS = 620;      // hover a closed folder this long and it opens
+  const EDGE_PX = 28;         // auto-scroll band at the top and bottom
+
+  // Frozen when a drag starts: every row needs to know its folder and its
+  // neighbours to turn a drop position into "before this sibling", and the
+  // tree can't change while a finger is down on it.
+  function buildDragIndex() {
+    const map = new Map();
+    const walk = (nodes, parent) => {
+      nodes.forEach((node, i) => {
+        map.set(node.path, { node, parent, siblings: nodes, i });
+        if (node.children) walk(node.children, node.path);
+      });
+    };
+    walk(state.tree || [], "");
+    return map;
+  }
+
+  function rowUnderPoint(x, y) {
+    const el = document.elementFromPoint(x, y);
+    if (!el) return null;
+    const row = el.closest ? el.closest(".row[data-path]") : null;
+    return row && els.tree.contains(row) ? row : null;
+  }
+
+  // Which folder a drop lands in, and which sibling it lands in front of.
+  // `null` for "the end of that folder".
+  function dropTarget(x, y) {
+    const box = els.tree.getBoundingClientRect();
+    if (x < box.left || x > box.right || y < box.top || y > box.bottom) return null;
+
+    const row = rowUnderPoint(x, y);
+    if (!row) return { destination: "", before: null, kind: "root" };
+
+    const path = row.getAttribute("data-path");
+    const entry = drag.index.get(path);
+    if (!entry) return null;
+
+    const rect = row.getBoundingClientRect();
+    // A folder's middle band drops *into* it; its top and bottom edges still
+    // reorder around it, so a folder can be both a container and a neighbour.
+    if (row.classList.contains("dir")) {
+      const edge = Math.min(10, rect.height * 0.3);
+      if (y > rect.top + edge && y < rect.bottom - edge) {
+        return { destination: path, before: null, kind: "into", row };
+      }
+    }
+    const after = y > rect.top + rect.height / 2;
+    const next = entry.siblings[entry.i + 1];
+    return {
+      destination: entry.parent,
+      before: after ? (next ? next.path : null) : path,
+      kind: "between",
+      row,
+      after,
+    };
+  }
+
+  function targetAllowed(target) {
+    if (!target || !drag.item) return false;
+    const src = drag.item.path;
+    // Nothing can be dropped inside itself.
+    if (drag.item.isDirectory
+        && (target.destination === src || target.destination.startsWith(src + "/"))) {
+      return false;
+    }
+    if (target.before === src) return false;
+    const entry = drag.index.get(src);
+    if (!entry) return true;
+    if (target.destination !== entry.parent) return true;
+    // Same folder: refuse the positions it already occupies, so a stray drag
+    // doesn't pin an otherwise name-sorted folder into a manual order.
+    if (target.kind === "into") return false;
+    const next = entry.siblings[entry.i + 1];
+    return target.before !== (next ? next.path : null);
+  }
+
+  function bindItemDrag(row, item) {
+    row.addEventListener("pointerdown", (e) => {
+      if (drag.active || state.renamingPath) return;
+      // Search results aren't tree rows — there is no folder to drop into.
+      if (state.searching && state.query.trim()) return;
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+
+      drag.item = item;
+      drag.row = row;
+      drag.pointerId = e.pointerId;
+      drag.startX = e.clientX;
+      drag.startY = e.clientY;
+      drag.moved = false;
+      // A mouse is picked up immediately and only becomes a drag once it
+      // travels; a finger has to hold still first, or every attempt to scroll
+      // the tree would pick a note up instead.
+      drag.lifted = e.pointerType === "mouse";
+      clearTimeout(drag.liftTimer);
+      if (e.pointerType !== "mouse") {
+        drag.liftTimer = setTimeout(() => {
+          drag.liftTimer = null;
+          if (drag.row !== row || drag.moved) return;
+          drag.lifted = true;
+          row.classList.add("lifted");
+          if (navigator.vibrate) navigator.vibrate(8);
+        }, LIFT_MS);
+      }
+    });
+
+    row.addEventListener("pointermove", (e) => {
+      if (drag.row !== row || e.pointerId !== drag.pointerId) return;
+      const far = Math.abs(e.clientX - drag.startX) > DRAG_SLOP
+        || Math.abs(e.clientY - drag.startY) > DRAG_SLOP;
+      if (!far) return;
+      if (!drag.lifted) {
+        // Moved before the hold completed: this was a scroll, not a pick-up.
+        drag.moved = true;
+        cancelPress();
+        return;
+      }
+      if (!drag.active) startDrag(e);
+      if (drag.active) updateDrag(e.clientX, e.clientY);
+    });
+
+    const finish = (e) => {
+      if (drag.row !== row) return;
+      const wasActive = drag.active;
+      const lifted = drag.lifted && !drag.moved;
+      if (wasActive) {
+        commitDrag();
+      } else if (lifted && e.pointerType !== "mouse") {
+        // Held still and let go: the long press was asking for the menu.
+        cancelPress();
+        showSheet(item);
+      } else {
+        cancelPress();
+      }
+    };
+    row.addEventListener("pointerup", finish);
+    row.addEventListener("pointercancel", () => { if (drag.row === row) endDrag(); });
+  }
+
+  function cancelPress() {
+    clearTimeout(drag.liftTimer);
+    drag.liftTimer = null;
+    if (drag.row) drag.row.classList.remove("lifted");
+    if (!drag.active) {
+      drag.item = null;
+      drag.row = null;
+      drag.pointerId = null;
+      drag.lifted = false;
+    }
+  }
+
+  function startDrag(e) {
+    clearTimeout(drag.liftTimer);
+    drag.liftTimer = null;
+    drag.active = true;
+    drag.index = buildDragIndex();
+    try { drag.row.setPointerCapture(drag.pointerId); } catch { /* gone */ }
+    drag.row.classList.remove("lifted");
+    drag.row.classList.add("drag-source");
+    document.body.classList.add("dragging-row");
+
+    const ghost = document.createElement("div");
+    ghost.className = "drag-ghost";
+    ghost.textContent = drag.item.title;
+    document.body.appendChild(ghost);
+    drag.ghost = ghost;
+
+    const line = document.createElement("div");
+    line.className = "drop-line";
+    line.hidden = true;
+    document.body.appendChild(line);
+    drag.line = line;
+  }
+
+  function updateDrag(x, y) {
+    if (drag.ghost) {
+      drag.ghost.style.left = x + "px";
+      drag.ghost.style.top = y + "px";
+    }
+    const target = dropTarget(x, y);
+    drag.target = targetAllowed(target) ? target : null;
+    paintTarget();
+    armSpring(target);
+    armAutoScroll(y);
+  }
+
+  function paintTarget() {
+    const target = drag.target;
+    const into = target && target.kind === "into" ? target.row : null;
+    if (drag.into !== into) {
+      if (drag.into) drag.into.classList.remove("drop-into");
+      if (into) into.classList.add("drop-into");
+      drag.into = into;
+    }
+    const line = drag.line;
+    if (!line) return;
+    if (!target || target.kind === "into") {
+      line.hidden = true;
+      return;
+    }
+    const treeBox = els.tree.getBoundingClientRect();
+    let top;
+    let left = treeBox.left + 8;
+    if (target.kind === "root") {
+      top = Math.min(treeBox.bottom - 1, treeBox.top + els.tree.scrollHeight - els.tree.scrollTop);
+    } else {
+      const rect = target.row.getBoundingClientRect();
+      top = target.after ? rect.bottom : rect.top;
+      // Sits under the row's own icon, so the indent shows which folder the
+      // note is about to land in rather than just where it goes vertically.
+      left = rect.left;
+    }
+    line.hidden = false;
+    line.style.top = Math.round(Math.max(treeBox.top, Math.min(treeBox.bottom, top))) + "px";
+    line.style.left = Math.round(left) + "px";
+    line.style.width = Math.round(treeBox.right - 8 - left) + "px";
+  }
+
+  // Spring-loaded folders: rest on a closed one and it opens, so a note can
+  // be carried into a folder several levels down in one gesture.
+  function armSpring(target) {
+    const path = target && target.kind === "into" && state.collapsed.has(target.destination)
+      ? target.destination
+      : null;
+    if (path === drag.springPath) return;
+    clearTimeout(drag.springTimer);
+    drag.springPath = path;
+    if (!path) return;
+    drag.springTimer = setTimeout(() => {
+      if (drag.springPath !== path || !drag.active) return;
+      springOpen(path);
+    }, SPRING_MS);
+  }
+
+  // Opens the folder in place. A full `renderTree()` here would throw away
+  // the row the pointer is currently captured by, which ends the drag.
+  function springOpen(path) {
+    state.collapsed.delete(path);
+    const row = rowForPath(path);
+    if (!row) return;
+    const kids = row.nextElementSibling;
+    if (kids) kids.hidden = false;
+    const chev = row.querySelector(".chevron");
+    if (chev) chev.innerHTML = iconHTML("chevronDown");
+    const icon = row.querySelector(".icon");
+    if (icon) icon.innerHTML = iconHTML("folderFill");
+  }
+
+  function armAutoScroll(y) {
+    const box = els.tree.getBoundingClientRect();
+    if (y < box.top + EDGE_PX) drag.scrollBy = -Math.ceil((box.top + EDGE_PX - y) / 3);
+    else if (y > box.bottom - EDGE_PX) drag.scrollBy = Math.ceil((y - (box.bottom - EDGE_PX)) / 3);
+    else drag.scrollBy = 0;
+
+    if (drag.scrollBy && !drag.scrollTimer) {
+      drag.scrollTimer = setInterval(() => {
+        if (!drag.active || !drag.scrollBy) return;
+        els.tree.scrollTop += drag.scrollBy;
+        paintTarget();
+      }, 16);
+    } else if (!drag.scrollBy && drag.scrollTimer) {
+      clearInterval(drag.scrollTimer);
+      drag.scrollTimer = null;
+    }
+  }
+
+  function commitDrag() {
+    const item = drag.item;
+    const target = drag.target;
+    endDrag();
+    // Suppresses the click the pointer sequence is about to synthesise, which
+    // would otherwise open whichever note the drag happened to end on. Armed
+    // even for a drop that goes nowhere, since that click is still coming.
+    swallowNextClick();
+    if (!item || !target) return;
+    moveItem(item, target).catch((err) => {
+      console.error(err);
+      toast(err.message || "Move failed");
+    });
+  }
+
+  function endDrag() {
+    clearTimeout(drag.liftTimer);
+    clearTimeout(drag.springTimer);
+    if (drag.scrollTimer) clearInterval(drag.scrollTimer);
+    if (drag.ghost) drag.ghost.remove();
+    if (drag.line) drag.line.remove();
+    if (drag.into) drag.into.classList.remove("drop-into");
+    if (drag.row) {
+      drag.row.classList.remove("drag-source", "lifted");
+      try { drag.row.releasePointerCapture(drag.pointerId); } catch { /* gone */ }
+    }
+    document.body.classList.remove("dragging-row");
+    drag.item = null;
+    drag.row = null;
+    drag.pointerId = null;
+    drag.lifted = false;
+    drag.moved = false;
+    drag.active = false;
+    drag.index = null;
+    drag.ghost = null;
+    drag.line = null;
+    drag.target = null;
+    drag.into = null;
+    drag.liftTimer = null;
+    drag.springTimer = null;
+    drag.springPath = null;
+    drag.scrollTimer = null;
+    drag.scrollBy = 0;
+  }
+
+  function swallowNextClick() {
+    const eat = (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+    };
+    document.addEventListener("click", eat, { capture: true, once: true });
+    // Nothing guarantees a click actually follows — a drag that ended over
+    // the editor produces none — so the listener can't be left armed.
+    setTimeout(() => document.removeEventListener("click", eat, { capture: true }), 350);
+  }
+
+  async function moveItem(item, target) {
+    // A queued autosave still names the old path; firing it after the move
+    // would write the note straight back where it came from.
+    await flushSave();
+    const res = await api("/api/tree/move", {
+      method: "POST",
+      body: JSON.stringify({
+        paths: [item.path],
+        destination: target.destination,
+        before: target.before,
+      }),
+    });
+    applyRemap((res && res.moved) || {});
+    await loadTree();
+  }
+
+  // Follows everything the client holds by path across a move: the open note,
+  // the selected folder, the rename in progress, and every collapsed folder.
+  function applyRemap(moved) {
+    const at = (p) => (p && Object.prototype.hasOwnProperty.call(moved, p) ? moved[p] : p);
+    if (state.path) state.path = at(state.path);
+    if (state.selectedDir) state.selectedDir = at(state.selectedDir);
+    if (state.renamingPath) state.renamingPath = at(state.renamingPath);
+    if (state.collapsed.size) state.collapsed = new Set([...state.collapsed].map(at));
+  }
+
+  async function clearManualOrder(path) {
+    try {
+      await api("/api/tree/order/clear", { method: "POST", body: JSON.stringify({ path }) });
+      await loadTree();
+    } catch (err) {
+      console.error(err);
+      toast(err.message || "Could not restore name order");
+    }
+  }
+
+  // ---- Dropping files in from the desktop ---------------------------------
+
+  const IMPORTABLE = new Set(["md", "markdown", "txt"]);
+  // Base64 inflates by a third and the server refuses a request over 64 MB,
+  // so uploads go in batches. One dropped folder splitting across two batches
+  // would land as "Notes" and "Notes 2", which this is comfortably large
+  // enough to avoid for any realistic folder of Markdown.
+  const UPLOAD_BATCH_BYTES = 24 * 1024 * 1024;
+
+  const extensionOf = (name) => {
+    const dot = name.lastIndexOf(".");
+    return dot < 0 ? "" : name.slice(dot + 1).toLowerCase();
+  };
+
+  function bindExternalDrop() {
+    const tree = els.tree;
+    if (!tree) return;
+    let depth = 0;
+    let lit = null;
+    const carriesFiles = (e) => {
+      const types = (e.dataTransfer && e.dataTransfer.types) || [];
+      return Array.prototype.indexOf.call(types, "Files") !== -1;
+    };
+    const light = (row) => {
+      if (lit === row) return;
+      if (lit) lit.classList.remove("drop-into");
+      if (row) row.classList.add("drop-into");
+      lit = row;
+    };
+    const clear = () => {
+      depth = 0;
+      tree.classList.remove("drop-external");
+      light(null);
+    };
+    const folderUnder = (x, y) => {
+      const row = rowUnderPoint(x, y);
+      return row && row.classList.contains("dir") ? row : null;
+    };
+
+    tree.addEventListener("dragenter", (e) => {
+      if (!carriesFiles(e)) return;
+      e.preventDefault();
+      depth += 1;
+      tree.classList.add("drop-external");
+    });
+    tree.addEventListener("dragover", (e) => {
+      if (!carriesFiles(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      light(folderUnder(e.clientX, e.clientY));
+    });
+    tree.addEventListener("dragleave", (e) => {
+      if (!carriesFiles(e)) return;
+      depth -= 1;
+      if (depth <= 0) clear();
+    });
+    tree.addEventListener("drop", (e) => {
+      if (!carriesFiles(e)) return;
+      e.preventDefault();
+      const row = folderUnder(e.clientX, e.clientY);
+      const destination = row ? row.getAttribute("data-path") : "";
+      clear();
+      // Both of these have to be read now: `dataTransfer` is emptied the
+      // moment this handler yields, so awaiting first loses the drop.
+      const entries = e.dataTransfer.items
+        ? Array.from(e.dataTransfer.items)
+            .map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null))
+            .filter(Boolean)
+        : [];
+      const flat = Array.from(e.dataTransfer.files || []);
+      importDropped(entries, flat, destination).catch((err) => {
+        console.error(err);
+        toast(err.message || "Import failed");
+      });
+    });
+  }
+
+  // Walks a dropped folder so it keeps its shape on the way in, the way the
+  // native sidebar's Finder drop does.
+  function readEntry(entry, prefix) {
+    return new Promise((resolve) => {
+      if (entry.isFile) {
+        entry.file(
+          (file) => resolve([{ path: prefix + entry.name, file }]),
+          () => resolve([])
+        );
+        return;
+      }
+      if (!entry.isDirectory) return resolve([]);
+      const reader = entry.createReader();
+      const found = [];
+      const step = () => {
+        reader.readEntries((batch) => {
+          // `readEntries` hands back at most a hundred at a time and signals
+          // the end with an empty batch, so it has to be drained in a loop.
+          if (!batch.length) {
+            Promise.all(found.map((child) => readEntry(child, prefix + entry.name + "/")))
+              .then((nested) => resolve([].concat.apply([], nested)));
+            return;
+          }
+          found.push.apply(found, batch);
+          step();
+        }, () => resolve([]));
+      };
+      step();
+    });
+  }
+
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = String(reader.result);
+        resolve(text.slice(text.indexOf(",") + 1));
+      };
+      reader.onerror = () => reject(reader.error || new Error("Unreadable file"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function importDropped(entries, flat, destination) {
+    let found;
+    if (entries.length) {
+      const nested = await Promise.all(entries.map((entry) => readEntry(entry, "")));
+      found = [].concat.apply([], nested);
+    } else {
+      found = flat.map((file) => ({ path: file.name, file }));
+    }
+    if (!found.length) return;
+
+    // Filtered before anything is read: a dropped folder of photos should
+    // cost nothing, not a base64 pass over every one of them.
+    const usable = found.filter((f) => IMPORTABLE.has(extensionOf(f.path)));
+    if (!usable.length) {
+      toast("Nothing imported — Markdown and text files only");
+      return;
+    }
+
+    let imported = 0;
+    let batch = [];
+    let bytes = 0;
+    const flush = async () => {
+      if (!batch.length) return;
+      const res = await api("/api/import", {
+        method: "POST",
+        body: JSON.stringify({ destination, files: batch }),
+      });
+      imported += (res && res.imported) || 0;
+      batch = [];
+      bytes = 0;
+    };
+    for (const f of usable) {
+      const data = await fileToBase64(f.file);
+      if (bytes && bytes + data.length > UPLOAD_BATCH_BYTES) await flush();
+      batch.push({ path: f.path, data });
+      bytes += data.length;
+    }
+    await flush();
+
+    const skipped = found.length - imported;
+    toast(
+      imported
+        ? "Imported " + imported + " file" + (imported === 1 ? "" : "s")
+          + (skipped > 0 ? ", skipped " + skipped : "")
+        : "Nothing imported"
+    );
+    await loadTree();
+  }
+
+  let toastTimer = null;
+  function toast(message) {
+    let el = document.getElementById("toast");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "toast";
+      el.className = "toast";
+      document.body.appendChild(el);
+    }
+    el.textContent = message;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove("show"), 2600);
+  }
+
   // Click-drag the strip at the sidebar's right edge to resize it, clamped
   // to the same 220–320px range the CSS already constrains it to.
   function bindSidebarResize() {
@@ -1129,6 +1846,15 @@
   restoreSidebarWidth();
 
   hydrateIcons();
+  bindExternalDrop();
+  // Non-passive, so a drag in progress can actually refuse the scroll. The
+  // tree's `touch-action: pan-y` can't be changed once a gesture has started.
+  els.tree.addEventListener("touchmove", (e) => {
+    if (drag.active) e.preventDefault();
+  }, { passive: false });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && drag.active) endDrag();
+  });
   preventChromeGestures();
   bindSwipe();
   drawEgg();
@@ -1136,7 +1862,7 @@
   applyAppearance(webThemeOverride() || "system");
   updateThemeButton(webThemeOverride() || "system");
   loadAppearance().catch(console.error);
-  window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+  lightQuery.addEventListener("change", () => {
     const current = document.documentElement.getAttribute("data-theme") || "system";
     if (current === "system") applyAppearance("system");
   });
