@@ -164,10 +164,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
-            MenuBarController.shared.showMainWindow()
-        }
-        return true
+        guard !flag else { return true }
+        // False means "handled, do nothing further". Returning true ran
+        // AppKit's own reopen alongside `showMainWindow`, and since that
+        // defers a turn before looking for a window tagged
+        // `.blackGlassMainWindow` — a tag SwiftUI only applies once it has
+        // attached its view hierarchy — AppKit's fresh window often wasn't
+        // tagged yet when we looked, so we opened a second one.
+        MenuBarController.shared.showMainWindow()
+        return false
     }
 
     /// Apple's standard signal for "this app was auto-launched at login" —
