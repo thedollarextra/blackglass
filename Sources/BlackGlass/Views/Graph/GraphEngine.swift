@@ -339,9 +339,11 @@ final class GraphEngine: ObservableObject {
     @Published private(set) var cameraRevision = 0
 
     // Scoping, all published so the toolbar reflects them.
-    @Published private(set) var scope: GraphScope = .local
+    @Published private(set) var scope: GraphScope = .global
     @Published private(set) var localDepth = 2
-    @Published private(set) var showOrphans = false
+    /// On by default: an unlinked note is still a note, and hiding them means
+    /// the note you currently have open can be missing from its own graph.
+    @Published private(set) var showOrphans = true
     @Published private(set) var is3D = false
     @Published private(set) var focusID: String?
 
@@ -1182,7 +1184,12 @@ final class GraphEngine: ObservableObject {
 
         func dimmed(_ i: Int) -> Bool {
             if let matches, !matches.contains(i) { return true }
-            if focusActive, !focusMask[i] { return true }
+            // Distance from the selection shades the *ego* view only — that is
+            // what its outer ring is for. In the whole-vault view every note
+            // stays at full brightness until a search narrows it; dimming
+            // everything a hop away from the open note made the graph look
+            // broken rather than focused.
+            if scope == .local, focusActive, !focusMask[i] { return true }
             return false
         }
 

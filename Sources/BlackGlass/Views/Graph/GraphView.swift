@@ -127,14 +127,21 @@ struct GraphView: View {
             .foregroundStyle(.secondary)
             .help("Hops out from the selected note")
         } else {
+            // Two distinct glyphs rather than one recoloured: which of the
+            // two states you are in has to read at a glance, and an accent
+            // tint alone doesn't say whether notes are being hidden.
             Button {
                 engine.setShowOrphans(!engine.showOrphans)
             } label: {
-                Image(systemName: "circle.dotted")
+                Image(systemName: engine.showOrphans
+                    ? "circle.dotted"
+                    : "point.3.connected.trianglepath.dotted")
             }
             .buttonStyle(.plain)
-            .foregroundStyle(engine.showOrphans ? Color.accentColor : Color.secondary)
-            .help(engine.showOrphans ? "Hide unlinked notes" : "Show unlinked notes")
+            .foregroundStyle(engine.showOrphans ? Color.secondary : Color.accentColor)
+            .help(engine.showOrphans
+                ? "Showing every note, unlinked ones as islands — show only connected notes"
+                : "Showing only connected notes — show every note")
         }
     }
 
