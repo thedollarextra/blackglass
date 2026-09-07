@@ -86,6 +86,27 @@ echo "==> Installing to $(pwd)/${APP}..."
 rm -rf "$APP"
 ditto --noextattr --norsrc "$STAGE" "$APP"
 
+# iCloud's file provider stamps FinderInfo onto a bundle the moment it notices
+# one, and codesign refuses to verify anything carrying it — the signature is
+# fine, the metadata beside it is not. Clearing it here handles the usual case.
+# If the daemon re-stamps it afterwards there is nothing this script can do
+# about it, so say what it means rather than leaving a scary verify failure
+# for whoever runs codesign next: the app still launches, and the copy that
+# was actually signed is clean.
+xattr -cr "$APP" 2>/dev/null || true
+case "$(pwd -P)" in
+  *"/Mobile Documents/"*)
+    # Clearing it above is worth doing but doesn't settle anything: the daemon
+    # re-stamps whenever it next notices the bundle, so a `codesign --verify`
+    # here would race it and could report clean a second before it isn't.
+    # Say so plainly rather than running a check whose answer is a coin toss.
+    echo "    note: this bundle lives in iCloud Drive, whose file provider stamps"
+    echo "          FinderInfo onto it. \`codesign --verify\` rejects that metadata"
+    echo "          even though the signature is sound — the app runs normally,"
+    echo "          and the copy signed under \$SCRATCH verifies clean."
+    ;;
+esac
+
 if [ -d "$FINISHED" ]; then
   echo "==> Copying to ${FINISHED}/${APP}..."
   rm -rf "$FINISHED/$APP"

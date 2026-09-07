@@ -126,9 +126,21 @@ final class MenuBarController: NSObject, ObservableObject {
         // Only a tagged main window counts: with note pop-out windows also
         // supported now, `canBecomeMain` alone could match one of those and
         // skip surfacing (or creating) an actual main window.
-        for window in NSApp.windows where window.identifier == .blackGlassMainWindow {
-            window.makeKeyAndOrderFront(nil)
-            configureBlackGlassWindow(window)
+        //
+        // Exactly one of them, though — this used to order in every window
+        // that matched. `NSApp.windows` lists windows the app has already
+        // closed, because SwiftUI keeps a closed `WindowGroup` window alive
+        // rather than deallocating it, and each one was tagged when it was
+        // first shown. So reopening with nothing on screen resurrected every
+        // main window the session had ever closed, which is why clicking the
+        // Dock icon brought back two at once. An already-visible window is
+        // preferred (reopening should surface what is there, not raise
+        // something from the dead); failing that the most recent one is
+        // reused, so its selection and scroll position come back with it.
+        let mainWindows = NSApp.windows.filter { $0.identifier == .blackGlassMainWindow }
+        if let target = mainWindows.first(where: { $0.isVisible }) ?? mainWindows.last {
+            target.makeKeyAndOrderFront(nil)
+            configureBlackGlassWindow(target)
             didShow = true
         }
         if !didShow {

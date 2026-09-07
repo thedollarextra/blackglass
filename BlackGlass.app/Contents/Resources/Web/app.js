@@ -770,6 +770,19 @@
     }
   }
 
+  // Whichever search is currently open, as a set of matching paths — or null
+  // when nothing is being searched. Mirrors the Mac app, where either search
+  // dims the graph and the absence of one leaves it at full strength.
+  function graphMatches() {
+    if (state.omni && state.omniQuery.trim()) {
+      return new Set((state.omniResults || []).map((r) => r.path));
+    }
+    if (state.searching && state.query.trim()) {
+      return new Set((state.results || []).map((r) => r.path));
+    }
+    return null;
+  }
+
   function layoutGraph() {
     const nodes = state.graphNodes;
     const n = nodes.length;
@@ -831,11 +844,17 @@
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, w, h);
     const idx = Object.fromEntries((state.graphNodes || []).map((n) => [n.id, n]));
-    g.strokeStyle = "rgba(160,160,160,0.4)";
+    const matches = graphMatches();
+    const hit = (path) => !matches || matches.has(path);
     g.lineWidth = 1;
     (state.graphEdges || []).forEach((e) => {
       const a = idx[e.from], b = idx[e.to];
       if (!a || !b) return;
+      // Recessive rather than hidden: the shape of the vault is what makes
+      // the matches worth looking at.
+      g.strokeStyle = hit(e.from) && hit(e.to)
+        ? "rgba(160,160,160,0.4)"
+        : "rgba(160,160,160,0.1)";
       g.beginPath();
       g.moveTo(a.x, a.y);
       g.lineTo(b.x, b.y);
@@ -848,14 +867,20 @@
     g.font = "11px -apple-system, sans-serif";
     g.textAlign = "center";
     (state.graphNodes || []).forEach((n) => {
+      const dim = !hit(n.path) && n.path !== state.path;
+      g.globalAlpha = dim ? 0.22 : 1;
       g.beginPath();
       g.arc(n.x, n.y, n.unresolved ? 4 : 7, 0, Math.PI * 2);
       g.fillStyle = n.unresolved ? "rgba(160,160,160,0.5)" : (n.path === state.path ? "#0a84ff" : textColor);
       g.fill();
-      if (!n.unresolved) {
+      // A dimmed node keeps its dot but loses its label: at vault scale the
+      // labels are most of the ink, and leaving them all up is what stops a
+      // search from reading as a narrowing.
+      if (!n.unresolved && !dim) {
         g.fillStyle = textColor;
         g.fillText(n.title, n.x, n.y + 18);
       }
+      g.globalAlpha = 1;
     });
   }
 
@@ -880,12 +905,14 @@
     if (!state.query.trim()) {
       state.results = [];
       renderTree();
+      if (state.graph) drawGraph();
       return;
     }
     const results = await api("/api/search?q=" + encodeURIComponent(state.query));
     if (seq !== searchSeq) return;
     state.results = results;
     renderTree();
+    if (state.graph) drawGraph();
   }
 
   let omniSeq = 0;
@@ -927,6 +954,7 @@
     if (!state.omniQuery.trim()) {
       state.omniResults = [];
       renderOmni();
+      if (state.graph) drawGraph();
       return;
     }
     const results = await api("/api/search?q=" + encodeURIComponent(state.omniQuery));
@@ -934,6 +962,7 @@
     state.omniResults = results;
     state.omniIndex = 0;
     renderOmni();
+    if (state.graph) drawGraph();
   }
 
   function renderOmni() {
