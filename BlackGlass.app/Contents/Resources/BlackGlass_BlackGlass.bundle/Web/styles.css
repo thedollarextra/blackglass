@@ -458,6 +458,24 @@ body.dragging-row {
   text-overflow: ellipsis;
 }
 
+/* The heading turned into a field by a double-click. Inherits the title's own
+   weight and size so the text doesn't jump as it's swapped in. */
+.title-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--rename);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--text);
+  font-weight: 600;
+  font-size: 15px;
+  font-family: inherit;
+  padding: 1px 5px;
+  margin: -2px 0;
+  outline: none;
+  user-select: text;
+}
+
 .egg {
   width: 28px;
   height: 28px;

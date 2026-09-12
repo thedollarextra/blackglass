@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 public enum EditorMode: String, CaseIterable, Identifiable {
     case uncooked
@@ -45,6 +46,12 @@ public struct EditorView: View {
     @State private var lastSaved: String = ""
     @State private var requestFocusAtStart = false
 
+    /// Renaming the open note from its own heading. Deliberately not routed
+    /// through the sidebar's `renamingID`: that drives the tree's inline
+    /// field, and having both open at once would be two editors of one name.
+    @State private var isRenamingTitle = false
+    @State private var titleDraft = ""
+
     @State private var showFind = false
     @State private var findQuery = ""
     @State private var findMatchCount = 0
@@ -59,16 +66,45 @@ public struct EditorView: View {
         }
     }
 
+    private func finishTitleRename(focusEditor: Bool) {
+        guard isRenamingTitle else { return }
+        isRenamingTitle = false
+        let renamed = vaultManager.commitRename(fileItem, to: titleDraft, focusEditor: focusEditor)
+        // The file moved, so the selection driving this view still names the
+        // old path. `onNavigate` is what the sidebar's rename does by way of
+        // `windowState.remap`, and it also re-reveals the row in the tree.
+        if renamed.id != fileItem.id { onNavigate(renamed) }
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 if showSidebarToggle {
                     SidebarToggle(sidebarVisible: $sidebarVisible)
                 }
-                Text(fileItem.displayTitle)
-                    .font(.headline)
-                    .lineLimit(1)
-                    .help(fileItem.url.path)
+                if isRenamingTitle {
+                    InlineRenameField(
+                        text: $titleDraft,
+                        font: .boldSystemFont(ofSize: NSFont.preferredFont(forTextStyle: .headline).pointSize),
+                        onCommit: { focusEditor in finishTitleRename(focusEditor: focusEditor) },
+                        onCancel: { isRenamingTitle = false }
+                    )
+                    .frame(maxWidth: 420)
+                    .blocksWindowDrag()
+                } else {
+                    Text(fileItem.displayTitle)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .help("\(fileItem.url.path)\n\nDouble-click to rename")
+                        // Without this the heading is window-drag background,
+                        // and the second click of a double-click is taken by
+                        // the titlebar (zoom/minimise) before SwiftUI sees it.
+                        .blocksWindowDrag()
+                        .onTapGesture(count: 2) {
+                            titleDraft = fileItem.displayTitle
+                            isRenamingTitle = true
+                        }
+                }
 
                 Spacer(minLength: 8)
                     .systemTitlebarDoubleClick()

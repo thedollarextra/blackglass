@@ -3,6 +3,10 @@ import AppKit
 
 struct InlineRenameField: NSViewRepresentable {
     @Binding var text: String
+    /// Defaulted so the sidebar's rows are unaffected. The editor header
+    /// renames with the same field and has to keep its heavier heading font,
+    /// or the title visibly shrinks the moment it's double-clicked.
+    var font: NSFont = .systemFont(ofSize: NSFont.systemFontSize)
     var onCommit: (_ focusEditor: Bool) -> Void
     var onCancel: () -> Void
 
@@ -15,7 +19,7 @@ struct InlineRenameField: NSViewRepresentable {
         field.isBordered = false
         field.drawsBackground = false
         field.focusRingType = .none
-        field.font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        field.font = font
         field.textColor = .labelColor
         field.lineBreakMode = .byTruncatingTail
         field.cell?.isScrollable = true
@@ -26,6 +30,7 @@ struct InlineRenameField: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: RenameTextField, context: Context) {
+        if nsView.font != font { nsView.font = font }
         context.coordinator.text = $text
         context.coordinator.onCommit = onCommit
         context.coordinator.onCancel = onCancel

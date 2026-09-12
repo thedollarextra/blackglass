@@ -523,6 +523,56 @@
     return state.selection.size > 1 && state.selection.has(item.path);
   }
 
+  // Double-clicking the title above the editor renames the open note, the
+  // same way double-clicking its row in the tree does. Swaps the heading for
+  // a field in place rather than reusing `state.renamingPath`, which drives
+  // the tree's own inline field — both being open at once would leave two
+  // editors of the same name fighting over it.
+  function beginTitleRename() {
+    const path = state.path || state.selectedDir;
+    if (!path || state.renamingPath) return;
+    if (els.noteTitle.querySelector(".title-input")) return;
+
+    const original = els.noteTitle.textContent;
+    const input = document.createElement("input");
+    input.className = "title-input";
+    input.value = original;
+    input.setAttribute("aria-label", "Rename");
+
+    let settled = false;
+    const finish = (commit) => {
+      if (settled) return;
+      settled = true;
+      const value = input.value;
+      // Put the heading back before anything async runs: a failed rename
+      // would otherwise leave the field sitting there with no way out.
+      els.noteTitle.textContent = original;
+      if (!commit) return;
+      // `focusEditor` is true so the caret lands in the note afterwards, and
+      // because `commitRename` only proceeds for the row the tree believes is
+      // being renamed — which is nothing, since this field isn't that one.
+      commitRename(path, value, true).catch(console.error);
+    };
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        finish(true);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        finish(false);
+      }
+    });
+    input.addEventListener("blur", () => finish(true));
+    // Keeps a double-click inside the field from re-entering this.
+    input.addEventListener("dblclick", (e) => e.stopPropagation());
+
+    els.noteTitle.textContent = "";
+    els.noteTitle.appendChild(input);
+    input.focus();
+    input.select();
+  }
+
   function bindItemMenu(row, item) {
     row.addEventListener("contextmenu", (e) => {
       e.preventDefault();
@@ -2016,6 +2066,10 @@
     } catch { /* private browsing */ }
   }
 
+  if (els.noteTitle) {
+    els.noteTitle.addEventListener("dblclick", beginTitleRename);
+    els.noteTitle.title = "Double-click to rename";
+  }
   if (els.themeBtn) els.themeBtn.addEventListener("click", cycleTheme);
   bindSidebarResize();
   restoreSidebarWidth();
