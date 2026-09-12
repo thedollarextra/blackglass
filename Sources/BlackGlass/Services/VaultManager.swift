@@ -87,6 +87,7 @@ public final class VaultManager: ObservableObject {
 
         loadVaults()
         ensureDefaultVaultIfNeeded()
+
     }
 
     public func loadVaults() {
@@ -152,7 +153,10 @@ public final class VaultManager: ObservableObject {
             indexer.clear()
             return
         }
-        setFileTree(loadDirectory(at: active.url))
+        // Standardized once here rather than per entry inside `FileItem`:
+        // everything below is this URL plus a name, so the children are
+        // already standardized by construction.
+        setFileTree(loadDirectory(at: active.url.standardizedFileURL))
     }
 
     /// Full reindex of the active vault. Only on vault switch, launch, or the
@@ -873,12 +877,12 @@ public final class VaultManager: ObservableObject {
 
             if isDir {
                 let subItems = loadDirectory(at: fileURL)
-                items.append(FileItem(url: fileURL, isDirectory: true, children: subItems, modifiedAt: modDate))
+                items.append(FileItem(standardizedURL: fileURL, isDirectory: true, children: subItems, modifiedAt: modDate))
             } else if Self.importableExtensions.contains(fileURL.pathExtension.lowercased()) {
                 // The shared set rather than an array literal: this is the
                 // inner loop of a full-vault walk, and the literal was
                 // allocating a three-element array once per file in the vault.
-                items.append(FileItem(url: fileURL, isDirectory: false, modifiedAt: modDate))
+                items.append(FileItem(standardizedURL: fileURL, isDirectory: false, modifiedAt: modDate))
             }
         }
         return items

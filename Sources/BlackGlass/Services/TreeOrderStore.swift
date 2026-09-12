@@ -30,21 +30,28 @@ final class TreeOrderStore {
     /// note added on disk since the last reorder still shows up predictably
     /// instead of vanishing or jumping to the top.
     func sorted(_ urls: [URL], in folder: URL) -> [URL] {
-        let byName = urls.sorted {
-            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+        // Names are pulled out once and carried alongside their URLs. Asking
+        // each URL for `lastPathComponent` from inside the comparator
+        // recomputed it O(n log n) times, allocating a fresh path string for
+        // every comparison — on a real vault that was most of the cost of
+        // loading the tree, and the tree is reloaded after every edit.
+        var named = urls.map { ($0.lastPathComponent, $0) }
+        named.sort { $0.0.localizedStandardCompare($1.0) == .orderedAscending }
+        guard let placed = order[folder.standardizedFileURL.path], !placed.isEmpty else {
+            return named.map { $0.1 }
         }
-        guard let placed = order[folder.standardizedFileURL.path], !placed.isEmpty else { return byName }
 
         let rank = Dictionary(uniqueKeysWithValues: placed.enumerated().map { ($1, $0) })
-        return byName.sorted { a, b in
-            switch (rank[a.lastPathComponent], rank[b.lastPathComponent]) {
+        named.sort { a, b in
+            switch (rank[a.0], rank[b.0]) {
             case let (x?, y?): return x < y
             case (_?, nil): return true
             case (nil, _?): return false
             case (nil, nil):
-                return a.lastPathComponent.localizedStandardCompare(b.lastPathComponent) == .orderedAscending
+                return a.0.localizedStandardCompare(b.0) == .orderedAscending
             }
         }
+        return named.map { $0.1 }
     }
 
     /// Records `names` as the full order of `folder`'s children.

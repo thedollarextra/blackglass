@@ -21,6 +21,20 @@ public struct FileItem: Identifiable, Hashable, Sendable {
         self.modifiedAt = modifiedAt
     }
 
+    /// For the vault walk, where the URL is already standardized because it
+    /// came from enumerating an already-standardized parent.
+    /// `standardizedFileURL` can touch the filesystem, and paying for it once
+    /// per entry on every tree load is pure repetition of work the root
+    /// already did.
+    init(standardizedURL url: URL, isDirectory: Bool, children: [FileItem]? = nil, modifiedAt: Date? = nil) {
+        self.id = url.path
+        self.name = url.lastPathComponent
+        self.url = url
+        self.isDirectory = isDirectory
+        self.children = children
+        self.modifiedAt = modifiedAt
+    }
+
     /// Strips `.md` or `.txt` extensions for a cleaner notebook look in the tree
     public var displayTitle: String {
         if isDirectory { return name }

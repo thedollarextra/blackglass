@@ -72,7 +72,9 @@ enum GraphBuilder {
             }
         }
         if Task.isCancelled { return GraphData() }
-        return assemble(&tables, links: linksByFile)
+        // Already materialised, because the parallel read needs somewhere to
+        // collect into.
+        return assemble(&tables, fileCount: linksByFile.count) { linksByFile[$0] }
     }
 
     /// Blocking variant for the embedded web server, which answers on the main
@@ -81,8 +83,13 @@ enum GraphBuilder {
         let files = GraphScanner.noteURLs(in: vault)
         if files.isEmpty { return GraphData() }
         var tables = makeTables(files: files, vault: vault)
-        let links = files.map { OFMParser.extractLinksFast(read($0)) }
-        return assemble(&tables, links: links)
+        // Read and parsed one note at a time. This used to `map` the whole
+        // vault into an array of link arrays first and then loop over it,
+        // holding every note's links at once for no reason — this path is
+        // serial, so nothing needs them to exist together.
+        return assemble(&tables, fileCount: files.count) {
+            OFMParser.extractLinksFast(read(files[$0]))
+        }
     }
 
     private static func read(_ url: URL) -> String {
@@ -116,17 +123,23 @@ enum GraphBuilder {
         return t
     }
 
-    private static func assemble(_ t: inout Tables, links: [[WikiTarget]]) -> GraphData {
+    /// `links` is asked for one file at a time so a caller that has no reason
+    /// to hold the whole vault's links doesn't have to.
+    private static func assemble(
+        _ t: inout Tables,
+        fileCount: Int,
+        links: (Int) -> [WikiTarget]
+    ) -> GraphData {
         var degree = [Int32](repeating: 0, count: t.data.ids.count)
         // Collapses parallel and reciprocal links into one undirected edge, so a
         // note that references a neighbour ten times pulls on it once.
         var seen = Set<Int64>()
-        seen.reserveCapacity(links.count * 2)
-        for f in 0..<min(links.count, t.indexOfFile.count) {
+        seen.reserveCapacity(fileCount * 2)
+        for f in 0..<min(fileCount, t.indexOfFile.count) {
             let from = t.indexOfFile[f]
             guard from >= 0 else { continue }
             let folder = t.folderOf[from]
-            for link in links[f] where !link.dest.isEmpty && !link.isMedia {
+            for link in links(f) where !link.dest.isEmpty && !link.isMedia {
                 guard let to = resolve(
                     link.dest, folder: folder,
                     byPath: t.byPath, byStem: t.byStem, ids: t.data.ids
@@ -196,8 +209,12 @@ enum GraphScanner {
             guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
             urls.append(fileURL.standardizedFileURL)
         }
-        urls.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
-        return urls
+        // Paths are taken once and sorted with their URLs. `$0.path` inside
+        // the comparator rebuilt the whole path string on every comparison,
+        // which on a vault of any size is the bulk of this function.
+        var keyed = urls.map { ($0.path, $0) }
+        keyed.sort { $0.0.localizedStandardCompare($1.0) == .orderedAscending }
+        return keyed.map { $0.1 }
     }
 
     static func relative(_ url: URL, vault: URL) -> String {

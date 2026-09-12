@@ -244,7 +244,14 @@ final class NoteServer: ObservableObject {
 
         case ("GET", "/api/tree"):
             vaultManager.refreshFileTree()
-            let nodes = vaultManager.fileTree.map { Self.encode($0, vault: vaultURL, manager: vaultManager) }
+            // The prefix is derived once for the whole tree. Encoding used to
+            // call `relative(_:vault:)` per node, which standardized *both*
+            // the node's URL and the vault's and rebuilt both path strings —
+            // thousands of times over, for a prefix that never changes.
+            let rootPrefix = vaultURL.standardizedFileURL.path + "/"
+            let nodes = vaultManager.fileTree.map {
+                Self.encode($0, rootPrefix: rootPrefix, manager: vaultManager)
+            }
             return .json(nodes)
 
         case ("GET", "/api/note"):
@@ -267,6 +274,11 @@ final class NoteServer: ObservableObject {
             }
             do {
                 try content.write(to: url, atomically: true, encoding: .utf8)
+                // The Mac editor routes every save through this; the web one
+                // wrote straight to disk and told nobody, so a note edited
+                // from a phone stayed invisible to search under its new text,
+                // and the cached link graph kept describing the old one.
+                vaultManager.noteContentDidChange(at: url, content: content)
                 return .json(["ok": true])
             } catch {
                 return .json(["error": error.localizedDescription], status: 500)
@@ -412,10 +424,24 @@ final class NoteServer: ObservableObject {
             return .json(results)
 
         case ("GET", "/api/graph"):
-            let snapshot = GraphScanner.snapshot(vault: vaultURL)
+            // Shares the cache the Mac app's graph view fills, instead of
+            // re-walking the vault and re-reading every note on each request.
+            // `VaultManager` already drops this on a save, move, delete,
+            // import or rename, which is exactly when the link set can change.
+            let data: GraphData
+            if let cached = vaultManager.cachedGraph(for: vault) {
+                data = cached
+            } else {
+                data = GraphBuilder.buildSync(vault: vaultURL)
+                vaultManager.cacheGraph(data, for: vault)
+            }
             return .json([
-                "nodes": snapshot.nodes.map { ["id": $0.path, "title": $0.title, "path": $0.path, "unresolved": $0.unresolved] as [String: Any] },
-                "edges": snapshot.edges.map { ["from": $0.from, "to": $0.to] as [String: Any] }
+                "nodes": (0..<data.nodeCount).map {
+                    ["id": data.ids[$0], "title": data.titles[$0], "path": data.ids[$0], "unresolved": false] as [String: Any]
+                },
+                "edges": (0..<data.edgeCount).map {
+                    ["from": data.ids[Int(data.edgeA[$0])], "to": data.ids[Int(data.edgeB[$0])]] as [String: Any]
+                }
             ] as [String: Any])
 
         case ("GET", "/api/render"):
@@ -560,13 +586,18 @@ final class NoteServer: ObservableObject {
     private static func webRoot() -> URL? { cachedWebRoot }
 
     @MainActor
-    private static func encode(_ item: FileItem, vault: URL, manager: VaultManager) -> APINode {
+    private static func encode(_ item: FileItem, rootPrefix: String, manager: VaultManager) -> APINode {
         APINode(
             title: item.displayTitle,
-            path: relative(item.url, vault: vault),
+            // `item.id` is already the standardized path — the walk built it —
+            // so the vault-relative path is a prefix drop, not a fresh
+            // standardize-and-stringify of the URL.
+            path: item.id.hasPrefix(rootPrefix)
+                ? String(item.id.dropFirst(rootPrefix.count))
+                : item.name,
             isDirectory: item.isDirectory,
             manualOrder: item.isDirectory && manager.hasManualOrder(item.url) ? true : nil,
-            children: item.children?.map { encode($0, vault: vault, manager: manager) }
+            children: item.children?.map { encode($0, rootPrefix: rootPrefix, manager: manager) }
         )
     }
 
